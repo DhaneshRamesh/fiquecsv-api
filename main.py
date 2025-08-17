@@ -11,8 +11,9 @@ app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
 # ---------- config ----------
-TRN_EP = os.environ.get("TRANSLATOR_ENDPOINT", "").rstrip("/")
-TRN_KEY = os.environ.get("TRANSLATOR_KEY", "")
+TRN_EP = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
+TRN_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
+TRN_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "westeurope")
 AOAI_EP = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
 AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
@@ -30,10 +31,13 @@ def get_blob_client():
 
 # ---------- helpers ----------
 def translate_texts(texts: List[str], to_lang="en") -> List[str]:
-    _require(TRN_EP and TRN_KEY, "Translator not configured")
+    _require(TRN_EP and TRN_KEY and TRN_REGION, "Translator not configured")
     url = f"{TRN_EP}/translate?api-version=3.0&to={to_lang}"
-    headers = {"Content-Type":"application/json; charset=UTF-8",
-               "Ocp-Apim-Subscription-Key": TRN_KEY}
+    headers = {
+        "Ocp-Apim-Subscription-Key": TRN_KEY,
+        "Ocp-Apim-Subscription-Region": TRN_REGION,
+        "Content-Type": "application/json"
+    }
     payload = [{"Text": t or ""} for t in texts]
     with httpx.Client(timeout=60) as h:
         r = h.post(url, headers=headers, json=payload)
