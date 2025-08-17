@@ -1,83 +1,88 @@
-End-to-End Blueprint: Self-Service Translation & Entity-Extraction on Azure AI
+# 🚀 End-to-End Blueprint: Self-Service Translation & Entity-Extraction on Azure AI
 
-This is a battle-tested, production-ready pattern that turns a customer-uploaded Excel workbook into a translated & enriched workbook with new columns for:
+This project is a production-ready pattern that turns a customer-uploaded Excel workbook into a translated & enriched workbook with new columns for:
 
-🌍 Country
+* 🌍 Country
+* 📞 Phone  
+* 📖 Book ("Gyan Ganga" / "Way of Living")
+* 🏷️ Language mentioned in the text
 
-📞 Phone
+## 📐 High-Level Architecture
 
-📖 Book ("Gyan Ganga" / "Way of Living")
+**Azure Blob Storage** (`incoming/`, `processed/`) - Landing zone for uploaded `.xlsx` files and destination for enriched output
 
-🏷️ Language mentioned in the text
+**Event Grid** - Fires downstream workflow when a new file lands in `incoming/`
 
-1. High-Level Architecture
-#	Component	Why we need it
-1	Azure Blob Storage (incoming/, processed/)	Landing zone for the uploaded .xlsx + destination for the enriched output file
-2	Event Grid	Fires downstream workflow when a new file lands in incoming/
-3	Azure Function (Python)	Serverless brain:
-① Reads Excel sheet
-② Calls Azure Translator
-③ Calls Azure OpenAI for entity extraction
-④ Writes enriched output
-4	Azure AI Translator	Fast, low-cost, enterprise-grade language translation → English
-5	Azure OpenAI (GPT-4o, JSON mode)	One-shot entity extraction → no custom ML training required
-6	(Optional) Power Automate / Logic Apps	If you want a no-code pipeline instead of an Azure Function
-2. Flow (Step by Step)
+**Azure Function (Python)** - Serverless brain that reads Excel → calls Translator → calls OpenAI → writes enriched output
 
-Upload workbook → Blob Storage /incoming/
+**Azure AI Translator** - Fast, low-cost, enterprise-grade translation to English
 
-Event Grid notices new file → triggers Function
+**Azure OpenAI (GPT-4o, JSON mode)** - One-shot entity extraction, no custom ML training required
 
-Azure Function
+**Power Automate / Logic Apps** *(Optional)* - No-code pipeline alternative
 
-Loads the Excel file with openpyxl/pandas
+## 🔄 Flow
 
-Calls Translator → translate text to English
+1. Upload workbook → **Blob Storage `/incoming/`**
+2. Event Grid detects new file → triggers Function
+3. Azure Function:
+   * Loads Excel
+   * Calls Translator (translate text → English)
+   * Calls OpenAI GPT-4o (JSON mode) for entity extraction
+   * Writes enriched output to **`/processed/`**
+4. *(Optional)* Power Automate notifies user with processed file link
 
-Calls OpenAI GPT-4o (JSON mode) → extract entities (country, phone, book, language)
+## 🛠️ Tech Stack
 
-Writes enriched workbook → Blob Storage /processed/
+* **Compute**: Azure Function App (Python 3.12)
+* **Storage**: Azure Blob Storage (incoming + processed containers)
+* **Events**: Event Grid (BlobCreated trigger)
+* **AI Services**: Azure Translator + Azure OpenAI (GPT-4o, JSON mode)
+* **Optional**: Power Automate / Logic Apps
+* **CI/CD**: GitHub Actions for deployment
+* **Secrets**: Managed Identity + App Service Configuration
 
-(Optional) Notify user via Power Automate (email/Teams/Slack) with the processed file link
+## 💰 Cost Model
 
-3. Tech Stack
+* **Blob Storage** → negligible (<$0.01/month for MBs)
+* **Event Grid** → first 100K ops/month free
+* **Azure Functions** → 1M free executions/month
+* **Translator** → free 2M chars/month, then ~$10 per million
+* **OpenAI (GPT-4o JSON)** → ~$0.002–0.005 per 1K tokens
+* **Power Automate** → free basic tier
 
-Compute: Azure Function App (Python 3.12)
+## 📊 Architecture Flow
 
-Storage: Azure Blob Storage (hot tier, incoming + processed containers)
+**File Upload** → **Blob Storage (incoming)** → **Event Grid** → **Azure Function** → **Blob Storage (processed)**
 
-Events: Event Grid (BlobCreated trigger)
+The Azure Function handles:
+- **Translation** via Azure AI Translator
+- **Entity Extraction** via Azure OpenAI GPT-4o
+- **Optional Notification** via Power Automate
 
-AI Services:
+## 🚀 Quickstart
 
-Azure AI Translator (standard tier, pay-per-character)
+1. Upload a `.xlsx` file into **`incoming/`** container
+2. Pipeline runs automatically
+3. Download enriched `.xlsx` from **`processed/`** container
 
-Azure OpenAI (GPT-4o, JSON mode)
+## 🏗️ Setup
 
-Optional Integration: Power Automate / Logic Apps for no-code orchestration
+Clone the repository and deploy Azure resources using the provided Bicep templates. Configure your Azure Function App with the necessary environment variables for OpenAI and Translator endpoints. Deploy the function code using Azure Functions Core Tools.
 
-CI/CD: GitHub Actions → auto-deploy Function code
+## 📋 Configuration
 
-Secrets: Managed Identity + App Service Configuration
+Set up environment variables for:
+- `OPENAI_ENDPOINT` - Your Azure OpenAI service endpoint
+- `TRANSLATOR_ENDPOINT` - Azure Translator service endpoint  
+- `STORAGE_ACCOUNT_NAME` - Blob storage account name
 
-4. Cost Model (⚡ pay-as-you-go, low)
+The GPT-4o model extracts entities in JSON format with fields for country, phone, book, and language.
 
-Blob Storage: fractions of a cent per GB/month for Excel files
+## 🔧 Monitoring & Troubleshooting
 
-Event Grid: first 100K ops/month free
+Use Application Insights for function execution metrics and set up cost analysis alerts. For large files, increase function timeout settings. Implement exponential backoff for OpenAI rate limits.
 
-Azure Function: Free 1M executions/month, then ~$0.20 per extra million
+## 📄 License
 
-Translator: Free 2M chars/month, then ~$10 per extra million chars
-
-Azure OpenAI: depends on model (GPT-4o JSON ~$0.002–0.005 per 1K tokens)
-
-Optional Power Automate: Free basic tier, paid if enterprise connectors
-
-This doc + your FastAPI API is enough for your admin to see:
-
-What’s deployed
-
-Why each component exists
-
-Where costs may come in
+MIT License — free to fork and adapt.
