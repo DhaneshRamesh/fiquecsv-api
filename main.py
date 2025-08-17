@@ -1,6 +1,6 @@
 import os, io, time, json, logging
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 import pandas as pd
@@ -72,7 +72,10 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
     
     content = blob_client.download_blob().readall()
-    df = pd.read_excel(io.BytesIO(content))
+    if blob_name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
+    else:
+        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
 
     if text_column and text_column in df.columns:
         col = text_column
@@ -123,11 +126,11 @@ async def translate_api(payload: dict):
 @app.post("/process-xlsx")
 async def process_xlsx(blob_name: str, text_column: str | None = None):
     """
-    Process an Excel file from incoming/, save enriched file as CSV to processed/, and return it.
+    Process an Excel or CSV file from incoming/, save enriched file as CSV to processed/, and return it.
     blob_name: Path to file in incoming container (e.g., 'incoming/sample.xlsx').
     """
-    if not blob_name.lower().endswith((".xlsx",".xls")) or not blob_name.startswith("incoming/"):
-        raise HTTPException(400, "Provide valid blob_name (e.g., 'incoming/sample.xlsx')")
+    if not blob_name.lower().endswith((".xlsx",".xlsm",".xls",".csv")) or not blob_name.startswith("incoming/"):
+        raise HTTPException(400, "Provide valid blob_name (e.g., 'incoming/sample.xlsx' or 'incoming/sample.csv')")
     try:
         t0 = time.time()
         content, processed_blob_name = process_excel_blob(blob_name, text_column)
