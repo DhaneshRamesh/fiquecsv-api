@@ -46,10 +46,10 @@ def extract_entities(text: str) -> dict:
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
     headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
     prompt = f"""
-    Extract entities from the following text and return them as JSON with fields: country, phone, book, language_mentioned.
+    Extract entities from the following text and return them as JSON with fields: country, phone, book, language_mentioned, address.
     Book must be either "Gyan Ganga", "Way of Living", or empty string "". Use empty string "" for any field not found.
     Text: {text}
-    Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":""}}
+    Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}}
     """
     body = {
         "messages": [{"role": "user", "content": prompt}],
@@ -64,7 +64,7 @@ def extract_entities(text: str) -> dict:
         return json.loads(j["choices"][0]["message"]["content"])
     except:
         log.error({"op":"parse-failed", "text":text[:80]})
-        return {"country":"", "phone":"", "book":"", "language_mentioned":""}
+        return {"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}
 
 def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[bytes, str]:
     blob_service = get_blob_client()
@@ -88,7 +88,7 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
             rows.append(extract_entities(t))
         except Exception as e:
             log.exception({"op":"extract-failed","text":t[:80]})
-            rows.append({"country":"", "phone":"", "book":"", "language_mentioned":""})
+            rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
 
     edf = df.copy()
     edf["translated_en"] = translated
