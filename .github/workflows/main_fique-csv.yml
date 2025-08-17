@@ -26,16 +26,12 @@ jobs:
           path: |
             main.py
             requirements.txt
-            # add any other files your app needs at runtime
-            # e.g. static/, templates/, host.json, etc.
-            # !venv/
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     environment:
       name: Production
-      # url: (Cannot reference a later step output here)
 
     steps:
       - name: Download artifact from build job
@@ -54,7 +50,7 @@ jobs:
           app-name: 'fique-csv-cng0ewddbhhwebe8'
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A382845B1B624F33976A2F13D74E4979 }}
-          package: .  # deploy the downloaded artifact content
+          package: .
 
       - name: Verify deployment
         run: echo "Deployment completed. App URL: ${{ steps.deploy-to-webapp.outputs.webapp-url }}"
