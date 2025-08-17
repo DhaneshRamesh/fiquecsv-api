@@ -17,7 +17,7 @@ AOAI_EP = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
 AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
-STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "")
+STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
 def _require(cond, msg): 
     if not cond: raise HTTPException(500, msg)
@@ -72,10 +72,14 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
     
     content = blob_client.download_blob().readall()
-    if blob_name.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
-    else:
-        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+    try:
+        if blob_name.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
+        else:
+            df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+    except Exception as e:
+        log.exception({"op":"file-read-failed", "blob":blob_name})
+        raise HTTPException(400, f"Failed to read {blob_name}: {str(e)}")
 
     if text_column and text_column in df.columns:
         col = text_column
