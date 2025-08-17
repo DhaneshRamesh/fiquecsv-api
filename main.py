@@ -1,12 +1,11 @@
 import os, io, time, json, logging
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 import httpx
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
-from azure.eventgrid import EventGridEvent
 
 app = FastAPI()
 log = logging.getLogger("uvicorn.error")
@@ -15,8 +14,8 @@ log = logging.getLogger("uvicorn.error")
 TRN_EP = os.environ.get("TRANSLATOR_ENDPOINT", "").rstrip("/")
 TRN_KEY = os.environ.get("TRANSLATOR_KEY", "")
 AOAI_EP = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
-AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
+AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "")
 
@@ -26,7 +25,7 @@ def _require(cond, msg):
 # ---------- blob storage client ----------
 def get_blob_client():
     _require(STORAGE_ACCOUNT, "Storage account not configured")
-    credential = DefaultAzureCredential()  # Managed Identity
+    credential = DefaultAzureCredential()
     return BlobServiceClient(f"https://{STORAGE_ACCOUNT}.blob.core.windows.net", credential=credential)
 
 # ---------- helpers ----------
@@ -46,114 +45,35 @@ def extract_entities(text: str) -> dict:
     _require(AOAI_EP and AOAI_KEY and AOAI_DEP, "Azure OpenAI not configured")
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
     headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
-    schema = {
-        "type":"object",
-        "properties":{
-            "country":{"type":"string"},
-            "phone":{"type":"string"},
-            "book":{"type":"string", "enum":["Gyan Ganga", "Way of Living", ""]},
-            "language_mentioned":{"type":"string"}
-        },
-        "required":[]
-    }
+    prompt = f"""
+    Extract entities from the following text and return them as JSON with fields: country, phone, book, language_mentioned.
+    Book must be either "Gyan Ganga", "Way of Living", or empty string "". Use empty string "" for any field not found.
+    Text: {text}
+    Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":""}}
+    """
     body = {
-        "messages": [{"role": "user", "content": f"Extract the fields from this text. Text: {text}"}],
-        "response_format":{"type":"json_schema", "json_schema":{"name":"entities","schema":schema}}
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 0.3
     }
     with httpx.Client(timeout=60) as h:
         r = h.post(url, headers=headers, json=body)
         r.raise_for_status()
     j = r.json()
-    return json.loads(j["choices"][0]["message"]["content"])
+    try:
+        return json.loads(j["choices"][0]["message"]["content"])
+    except:
+        log.error({"op":"parse-failed", "text":text[:80]})
+        return {"country":"", "phone":"", "book":"", "language_mentioned":""}
 
-def process_excel_blob(blob_name: str) -> tuple[bytes, str]:
+def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[bytes, str]:
     blob_service = get_blob_client()
     container_name = "incoming"
     blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
     
-    # Download and read Excel
     content = blob_client.download_blob().readall()
     df = pd.read_excel(io.BytesIO(content))
 
-    # Pick a text column (best-effort guess)
-    candidates = [c for c in df.columns if c.lower() in {"text","message","content","description"}]
-    col = candidates[0] if candidates else df.columns[0]
-
-    # Translate and extract entities
-    texts = df[col].astype(str).tolist()
-    translated = translate_texts(texts, to_lang="en")
-    rows = []
-    for t in translated:
-        try:
-            rows.append(extract_entities(t))
-        except Exception as e:
-            log.exception({"op":"extract-failed","text":t[:80]})
-            rows.append({})
-
-    # Enrich DataFrame
-    edf = df.copy()
-    edf["translated_en"] = translated
-    ents_df = pd.json_normalize(rows)
-    out_df = pd.concat([edf, ents_df], axis=1)
-
-    # Save to BytesIO
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        out_df.to_excel(w, index=False)
-    out.seek(0)
-
-    # Upload to processed/
-    processed_blob_name = blob_name.replace("incoming/", "processed/").rsplit(".", 1)[0] + "_enriched.xlsx"
-    blob_client = blob_service.get_blob_client(container="processed", blob=processed_blob_name)
-    blob_client.upload_blob(out.getvalue(), overwrite=True)
-    log.info({"op":"blob-upload", "blob":processed_blob_name})
-
-    return out.getvalue(), processed_blob_name
-
-# ---------- endpoints ----------
-@app.post("/translate")
-async def translate_api(payload: dict):
-    """payload: { 'texts': ['...', '...'], 'to': 'en' }"""
-    texts = payload.get("texts") or []
-    to = payload.get("to", "en")
-    if not isinstance(texts, list) or len(texts) == 0:
-        raise HTTPException(400, "Provide texts: []")
-    t0 = time.time()
-    out = translate_texts([str(x) for x in texts], to_lang=to)
-    log.info({"op":"translate","n":len(texts),"ms":int((time.time()-t0)*1000)})
-    return {"translations": out}
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    """
-    Handle Event Grid events for new blobs in incoming/.
-    Process Excel and save enriched output to processed/.
-    """
-    events = await request.json()
-    for event in events:
-        if event.get("eventType") == "Microsoft.Storage.BlobCreated":
-            blob_name = event["data"]["blobUrl"].split(f"{STORAGE_ACCOUNT}.blob.core.windows.net/")[1]
-            if blob_name.startswith("incoming/"):
-                try:
-                    t0 = time.time()
-                    content, processed_blob_name = process_excel_blob(blob_name)
-                    log.info({"op":"webhook-process","blob":blob_name,"processed":processed_blob_name,"ms":int((time.time()-t0)*1000)})
-                except Exception as e:
-                    log.exception({"op":"webhook-failed","blob":blob_name})
-                    raise HTTPException(500, f"Failed to process {blob_name}")
-    return {"status": "ok"}
-
-@app.post("/process-xlsx")
-async def process_xlsx(file: UploadFile = File(...), text_column: str | None = None):
-    """
-    Manual upload endpoint for testing: process Excel, return enriched file, and save to processed/.
-    """
-    if not file.filename.lower().endswith((".xlsx",".xls")):
-        raise HTTPException(400, "Upload an .xlsx/.xls file")
-    content = await file.read()
-    df = pd.read_excel(io.BytesIO(content))
-
-    # Pick a text column
     if text_column and text_column in df.columns:
         col = text_column
     else:
@@ -168,28 +88,55 @@ async def process_xlsx(file: UploadFile = File(...), text_column: str | None = N
             rows.append(extract_entities(t))
         except Exception as e:
             log.exception({"op":"extract-failed","text":t[:80]})
-            rows.append({})
+            rows.append({"country":"", "phone":"", "book":"", "language_mentioned":""})
 
     edf = df.copy()
     edf["translated_en"] = translated
     ents_df = pd.json_normalize(rows)
     out_df = pd.concat([edf, ents_df], axis=1)
 
-    # Save to BytesIO
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        out_df.to_excel(w, index=False)
+    out = io.StringIO()
+    out_df.to_csv(out, index=False, encoding="utf-8")
+    out_bytes = out.getvalue().encode("utf-8")
     out.seek(0)
 
-    # Upload to processed/
-    enriched_filename = f"processed/{file.filename.rsplit('.',1)[0]}_enriched.xlsx"
-    blob_service = get_blob_client()
-    blob_client = blob_service.get_blob_client(container="processed", blob=enriched_filename)
-    blob_client.upload_blob(out.getvalue(), overwrite=True)
-    log.info({"op":"blob-upload","blob":enriched_filename})
+    processed_blob_name = blob_name.replace("incoming/", "processed/").rsplit(".", 1)[0] + "_enriched.csv"
+    blob_client = blob_service.get_blob_client(container="processed", blob=processed_blob_name)
+    blob_client.upload_blob(out_bytes, overwrite=True)
+    log.info({"op":"blob-upload", "blob":processed_blob_name})
 
-    return StreamingResponse(
-        out,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{enriched_filename.rsplit("/",1)[-1]}"'}
-    )
+    return out_bytes, processed_blob_name
+
+# ---------- endpoints ----------
+@app.post("/translate")
+async def translate_api(payload: dict):
+    """payload: { 'texts': ['...', '...'], 'to': 'en' }"""
+    texts = payload.get("texts") or []
+    to = payload.get("to", "en")
+    if not isinstance(texts, list) or len(texts) == 0:
+        raise HTTPException(400, "Provide texts: []")
+    t0 = time.time()
+    out = translate_texts([str(x) for x in texts], to_lang=to)
+    log.info({"op":"translate","n":len(texts),"ms":int((time.time()-t0)*1000)})
+    return {"translations": out}
+
+@app.post("/process-xlsx")
+async def process_xlsx(blob_name: str, text_column: str | None = None):
+    """
+    Process an Excel file from incoming/, save enriched file as CSV to processed/, and return it.
+    blob_name: Path to file in incoming container (e.g., 'incoming/sample.xlsx').
+    """
+    if not blob_name.lower().endswith((".xlsx",".xls")) or not blob_name.startswith("incoming/"):
+        raise HTTPException(400, "Provide valid blob_name (e.g., 'incoming/sample.xlsx')")
+    try:
+        t0 = time.time()
+        content, processed_blob_name = process_excel_blob(blob_name, text_column)
+        log.info({"op":"process-xlsx","blob":blob_name,"processed":processed_blob_name,"ms":int((time.time()-t0)*1000)})
+        return StreamingResponse(
+            io.BytesIO(content),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{processed_blob_name.rsplit("/",1)[-1]}"'}
+        )
+    except Exception as e:
+        log.exception({"op":"process-failed","blob":blob_name})
+        raise HTTPException(500, f"Failed to process {blob_name}")
