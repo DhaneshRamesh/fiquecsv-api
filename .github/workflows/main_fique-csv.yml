@@ -8,22 +8,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read # Required for actions/checkout
+      contents: read 
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Create and start virtual environment
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      # Optional: Add step to run tests here (PyTest, Django test suites, etc.)
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
-            main.py
-            requirements.txt
+            .
             !venv/
-
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -36,10 +41,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-
       - name: Add delay to avoid SCM restart conflict
         run: sleep 120  # 2-minute delay
-
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
@@ -47,6 +50,5 @@ jobs:
           app-name: 'fique-csv-cng0ewddbhhwebe8'  # Correct app name
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A382845B1B624F33976A2F13D74E4979 }}
-
       - name: Verify deployment
         run: echo "Deployment completed. App URL: ${{ steps.deploy-to-webapp.outputs.webapp-url }}"
