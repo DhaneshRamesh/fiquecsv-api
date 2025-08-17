@@ -1,3 +1,8 @@
 fastapi
-uvicorn[standard]
-gunicorn
+uvicorn
+httpx
+pandas
+openpyxl
+azure-storage-blob
+azure-identity
+azure-eventgrid
