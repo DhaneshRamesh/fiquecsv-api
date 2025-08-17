@@ -1,54 +1,60 @@
 name: Build and deploy Python app to Azure Web App - fique-csv
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read 
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python version
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Create and start virtual environment
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      # Optional: Add step to run tests here (PyTest, Django test suites, etc.)
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
-            .
-            !venv/
+            main.py
+            requirements.txt
+            # add any other files your app needs at runtime
+            # e.g. static/, templates/, host.json, etc.
+            # !venv/
+
   deploy:
     runs-on: ubuntu-latest
     needs: build
     environment:
-      name: 'Production'
-      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+      name: Production
+      # url: (Cannot reference a later step output here)
 
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
+          path: .
+
       - name: Add delay to avoid SCM restart conflict
-        run: sleep 120  # 2-minute delay
-      - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
+        run: sleep 120
+
+      - name: Deploy to Azure Web App
         id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
         with:
-          app-name: 'fique-csv-cng0ewddbhhwebe8'  # Correct app name
+          app-name: 'fique-csv-cng0ewddbhhwebe8'
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_A382845B1B624F33976A2F13D74E4979 }}
+          package: .  # deploy the downloaded artifact content
+
       - name: Verify deployment
         run: echo "Deployment completed. App URL: ${{ steps.deploy-to-webapp.outputs.webapp-url }}"
