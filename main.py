@@ -7,8 +7,11 @@ import pandas as pd
 from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
 
+# Custom logger
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("fiquebot")
+
 app = FastAPI()
-log = logging.getLogger("uvicorn.error")
 
 # ---------- config ----------
 TRN_EP = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
@@ -20,14 +23,20 @@ AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
-def _require(cond, msg): 
+def _require(cond, msg):
     if not cond: raise HTTPException(500, msg)
 
 # ---------- blob storage client ----------
 def get_blob_client():
     _require(STORAGE_ACCOUNT, "Storage account not configured")
-    credential = DefaultAzureCredential()
-    return BlobServiceClient(f"https://{STORAGE_ACCOUNT}.blob.core.windows.net", credential=credential)
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if connection_string:
+        log.info("Using connection string for Blob Service Client")
+        return BlobServiceClient.from_connection_string(connection_string)
+    else:
+        log.error("Connection string not found, falling back to DefaultAzureCredential")
+        credential = DefaultAzureCredential()
+        return BlobServiceClient(f"https://{STORAGE_ACCOUNT}.blob.core.windows.net", credential=credential)
 
 # ---------- helpers ----------
 def translate_texts(texts: List[str], to_lang="en") -> List[str]:
@@ -71,11 +80,17 @@ def extract_entities(text: str) -> dict:
         return {"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}
 
 def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[bytes, str]:
+    log.info({"op": "process-excel-start", "blob": blob_name})
     blob_service = get_blob_client()
     container_name = "incoming"
     blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
-    
-    content = blob_client.download_blob().readall()
+    log.info({"op": "blob-download-start", "blob": blob_name})
+    try:
+        content = blob_client.download_blob().readall()
+        log.info({"op": "blob-download-complete", "blob": blob_name})
+    except Exception as e:
+        log.exception({"op": "blob-download-failed", "blob": blob_name, "error": str(e)})
+        raise HTTPException(400, f"Failed to download {blob_name}: {str(e)}")
     try:
         if blob_name.lower().endswith(".csv"):
             df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
@@ -84,13 +99,11 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     except Exception as e:
         log.exception({"op":"file-read-failed", "blob":blob_name})
         raise HTTPException(400, f"Failed to read {blob_name}: {str(e)}")
-
     if text_column and text_column in df.columns:
         col = text_column
     else:
         candidates = [c for c in df.columns if c.lower() in {"text","message","content","description"}]
         col = candidates[0] if candidates else df.columns[0]
-
     texts = df[col].astype(str).tolist()
     translated = translate_texts(texts, to_lang="en")
     rows = []
@@ -100,25 +113,37 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
         except Exception as e:
             log.exception({"op":"extract-failed","text":t[:80]})
             rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
-
     edf = df.copy()
     edf["translated_en"] = translated
     ents_df = pd.json_normalize(rows)
     out_df = pd.concat([edf, ents_df], axis=1)
-
     out = io.StringIO()
     out_df.to_csv(out, index=False, encoding="utf-8")
     out_bytes = out.getvalue().encode("utf-8")
     out.seek(0)
-
     processed_blob_name = blob_name.replace("incoming/", "processed/").rsplit(".", 1)[0] + "_enriched.csv"
     blob_client = blob_service.get_blob_client(container="processed", blob=processed_blob_name)
     blob_client.upload_blob(out_bytes, overwrite=True)
     log.info({"op":"blob-upload", "blob":processed_blob_name})
-
     return out_bytes, processed_blob_name
 
 # ---------- endpoints ----------
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+@app.get("/debug-env")
+async def debug_env():
+    return {
+        "AZURE_TRANSLATOR_ENDPOINT": os.environ.get("AZURE_TRANSLATOR_ENDPOINT"),
+        "AZURE_TRANSLATOR_KEY": "REDACTED" if os.environ.get("AZURE_TRANSLATOR_KEY") else "MISSING",
+        "AZURE_TRANSLATOR_REGION": os.environ.get("AZURE_TRANSLATOR_REGION"),
+        "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT"),
+        "AZURE_OPENAI_API_KEY": "REDACTED" if os.environ.get("AZURE_OPENAI_API_KEY") else "MISSING",
+        "STORAGE_ACCOUNT_NAME": os.environ.get("STORAGE_ACCOUNT_NAME"),
+        "AZURE_STORAGE_CONNECTION_STRING": "REDACTED" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING") else "MISSING"
+    }
+
 @app.post("/translate")
 async def translate_api(payload: dict):
     """payload: { 'texts': ['...', '...'], 'to': 'en' }"""
