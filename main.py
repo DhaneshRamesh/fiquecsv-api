@@ -49,12 +49,14 @@ def translate_texts(texts: List[str], to_lang="en") -> List[str]:
         "Content-Type": "application/json"
     }
     translated = []
-    payload = [{"Text": t or ""} for t in texts]
-    with httpx.Client(timeout=60) as h:
-        r = h.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-    data = r.json()
-    translated.extend([item["translations"][0]["text"] for item in data])
+    for i in range(0, len(texts), 50):  # Batch in groups of 50
+        batch = texts[i:i + 50]
+        payload = [{"Text": t or ""} for t in batch]
+        with httpx.Client(timeout=60) as h:
+            r = h.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+        data = r.json()
+        translated.extend([item["translations"][0]["text"] for item in data])
     return translated
 
 def extract_entities(text: str) -> dict:
@@ -109,28 +111,31 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
         candidates = [c for c in df.columns if c.lower() in {"text","message","content","description"}]
         col = candidates[0] if candidates else df.columns[0]
     texts = df[col].astype(str).tolist()
-    # Take only the first non-'nan' value
-    first_valid_text = next((t for t in texts if t != 'nan'), None)
-    if first_valid_text:
-        translated = translate_texts([first_valid_text], to_lang="en")
+    # Filter out 'nan' values and get their indices
+    valid_indices = [i for i, t in enumerate(texts) if t != 'nan']
+    valid_texts = [t for t in texts if t != 'nan']
+    log.info({"op": "filtered-texts", "count": len(valid_texts)})
+    if valid_texts:
+        translated = translate_texts(valid_texts, to_lang="en")
         rows = []
-        try:
-            rows.append(extract_entities(translated[0]))
-        except Exception as e:
-            log.exception({"op":"extract-failed","text":translated[0][:80]})
-            rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
+        for t in translated:
+            try:
+                rows.append(extract_entities(t))
+            except Exception as e:
+                log.exception({"op":"extract-failed","text":t[:80]})
+                rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
     else:
-        translated = [""]
-        rows = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}]
-    # Create a new DataFrame with the same structure but only one row of translated data
-    edf = pd.DataFrame([df.iloc[0] if not df.empty else {}])  # Use the first row as a template
-    edf["translated_en"] = translated
-    ents_df = pd.json_normalize(rows)
+        translated = ["" for _ in range(len(df))]
+        rows = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""} for _ in range(len(df))]
+    # Create a new DataFrame with the same structure
+    edf = df.copy()
+    # Assign translated values only to rows with valid text
+    translated_full = ["" for _ in range(len(df))]
+    for i, idx in enumerate(valid_indices):
+        translated_full[idx] = translated[i] if i < len(translated) else ""
+    edf["translated_en"] = translated_full
+    ents_df = pd.DataFrame(rows, index=df.index)
     out_df = pd.concat([edf, ents_df], axis=1)
-    # Fill remaining rows with default values
-    if len(df) > 1:
-        default_row = pd.DataFrame([{"translated_en": "", "country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}] * (len(df) - 1))
-        out_df = pd.concat([out_df] + [default_row], ignore_index=True)
     out = io.StringIO()
     out_df.to_csv(out, index=False, encoding="utf-8")
     out_bytes = out.getvalue().encode("utf-8")
