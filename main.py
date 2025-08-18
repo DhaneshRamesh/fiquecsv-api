@@ -111,17 +111,18 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
         candidates = [c for c in df.columns if c.lower() in {"text","message","content","description"}]
         col = candidates[0] if candidates else df.columns[0]
     texts = df[col].astype(str).tolist()
-    # Filter out 'nan' values
     texts = [t for t in texts if t != 'nan']
     log.info({"op": "filtered-texts", "count": len(texts)})
     translated = translate_texts(texts, to_lang="en")
     rows = []
-    for t in translated:
-        try:
-            rows.append(extract_entities(t))
-        except Exception as e:
-            log.exception({"op":"extract-failed","text":t[:80]})
-            rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
+    for i in range(0, len(translated), 10):  # Batch entity extraction in groups of 10
+        batch = translated[i:i + 10]
+        for t in batch:
+            try:
+                rows.append(extract_entities(t))
+            except Exception as e:
+                log.exception({"op":"extract-failed","text":t[:80]})
+                rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
     edf = df.copy()
     edf["translated_en"] = translated
     ents_df = pd.json_normalize(rows)
