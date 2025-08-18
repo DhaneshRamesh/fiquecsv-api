@@ -41,6 +41,7 @@ def get_blob_client():
 # ---------- helpers ----------
 def translate_texts(texts: List[str], to_lang="en") -> List[str]:
     _require(TRN_EP and TRN_KEY and TRN_REGION, "Translator not configured")
+    log.info({"op": "translate-input", "texts": texts})
     url = f"{TRN_EP}/translate?api-version=3.0&to={to_lang}"
     headers = {
         "Ocp-Apim-Subscription-Key": TRN_KEY,
@@ -83,7 +84,6 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     log.info({"op": "process-excel-start", "blob": blob_name})
     blob_service = get_blob_client()
     container_name = "incoming"
-    # Remove extra 'incoming/' prefix from blob_name
     corrected_blob_name = blob_name.replace("incoming/", "")
     blob_client = blob_service.get_blob_client(container=container_name, blob=corrected_blob_name)
     log.info({"op": "blob-download-start", "blob": blob_name})
