@@ -118,23 +118,34 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     if valid_texts:
         translated = translate_texts(valid_texts, to_lang="en")
         rows = []
-        for t in translated:
+        valid_translations = []
+        valid_row_indices = []
+        for i, t in enumerate(translated):
             try:
-                rows.append(extract_entities(t))
+                entities = extract_entities(t)
+                # Check if entities are meaningful (at least one field is non-empty)
+                if any(entities[field] for field in entities):
+                    rows.append(entities)
+                    valid_translations.append(t)
+                    valid_row_indices.append(valid_indices[i])
             except Exception as e:
                 log.exception({"op":"extract-failed","text":t[:80]})
-                rows.append({"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""})
+                continue  # Skip this row if extraction fails
+        # Pad rows to match the full DataFrame length with defaults
+        full_rows = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""} for _ in range(len(df))]
+        for i, idx in enumerate(valid_row_indices):
+            if i < len(rows):
+                full_rows[idx] = rows[i]
+        translated_full = ["" for _ in range(len(df))]
+        for i, idx in enumerate(valid_row_indices):
+            translated_full[idx] = valid_translations[i] if i < len(valid_translations) else ""
     else:
-        translated = ["" for _ in range(len(df))]
-        rows = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""} for _ in range(len(df))]
+        translated_full = ["" for _ in range(len(df))]
+        full_rows = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""} for _ in range(len(df))]
     # Create a new DataFrame with the same structure
     edf = df.copy()
-    # Assign translated values only to rows with valid text
-    translated_full = ["" for _ in range(len(df))]
-    for i, idx in enumerate(valid_indices):
-        translated_full[idx] = translated[i] if i < len(translated) else ""
     edf["translated_en"] = translated_full
-    ents_df = pd.DataFrame(rows, index=df.index)
+    ents_df = pd.DataFrame(full_rows, index=df.index)
     out_df = pd.concat([edf, ents_df], axis=1)
     out = io.StringIO()
     out_df.to_csv(out, index=False, encoding="utf-8")
