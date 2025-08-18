@@ -83,7 +83,9 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
     log.info({"op": "process-excel-start", "blob": blob_name})
     blob_service = get_blob_client()
     container_name = "incoming"
-    blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+    # Remove extra 'incoming/' prefix from blob_name
+    corrected_blob_name = blob_name.replace("incoming/", "")
+    blob_client = blob_service.get_blob_client(container=container_name, blob=corrected_blob_name)
     log.info({"op": "blob-download-start", "blob": blob_name})
     try:
         content = blob_client.download_blob().readall()
