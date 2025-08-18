@@ -48,12 +48,16 @@ def translate_texts(texts: List[str], to_lang="en") -> List[str]:
         "Ocp-Apim-Subscription-Region": TRN_REGION,
         "Content-Type": "application/json"
     }
-    payload = [{"Text": t or ""} for t in texts]
-    with httpx.Client(timeout=60) as h:
-        r = h.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-    data = r.json()
-    return [item["translations"][0]["text"] for item in data]
+    translated = []
+    for i in range(0, len(texts), 50):  # Batch in groups of 50
+        batch = texts[i:i + 50]
+        payload = [{"Text": t or ""} for t in batch]
+        with httpx.Client(timeout=60) as h:
+            r = h.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+        data = r.json()
+        translated.extend([item["translations"][0]["text"] for item in data])
+    return translated
 
 def extract_entities(text: str) -> dict:
     _require(AOAI_EP and AOAI_KEY and AOAI_DEP, "Azure OpenAI not configured")
@@ -107,6 +111,9 @@ def process_excel_blob(blob_name: str, text_column: str | None = None) -> tuple[
         candidates = [c for c in df.columns if c.lower() in {"text","message","content","description"}]
         col = candidates[0] if candidates else df.columns[0]
     texts = df[col].astype(str).tolist()
+    # Filter out 'nan' values
+    texts = [t for t in texts if t != 'nan']
+    log.info({"op": "filtered-texts", "count": len(texts)})
     translated = translate_texts(texts, to_lang="en")
     rows = []
     for t in translated:
