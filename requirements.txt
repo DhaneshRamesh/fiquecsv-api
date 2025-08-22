@@ -1,9 +1,10 @@
 fastapi
 uvicorn
+gunicorn
 httpx
 pandas
 openpyxl
 azure-storage-blob
 azure-identity
-gunicorn
 aiofiles
+python-multipart
