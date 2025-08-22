@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fiquebot – Translate & Enrich</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Tailwind (Play CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div class="max-w-5xl mx-auto p-6 space-y-6">
+    <header class="flex items-center justify-between">
+      <h1 class="text-2xl font-bold">Fiquebot – Self-Service Translation & Entity Extraction</h1>
+      <span class="text-xs text-gray-500">Frontend: single-file, same-origin API</span>
+    </header>
+
+    <!-- Tabs -->
+    <nav class="flex gap-2">
+      <button data-tab="upload" class="tab-btn px-4 py-2 rounded-xl bg-gray-900 text-white">Upload & Process</button>
+      <button data-tab="existing" class="tab-btn px-4 py-2 rounded-xl bg-gray-200">Process Existing Blob</button>
+      <button data-tab="translate" class="tab-btn px-4 py-2 rounded-xl bg-gray-200">Translate Tester</button>
+    </nav>
+
+    <!-- Upload & Process -->
+    <section id="tab-upload" class="tab-panel bg-white rounded-2xl shadow p-5 space-y-4">
+      <h3 class="font-semibold">Upload file & process</h3>
+      <div class="grid md:grid-cols-2 gap-4">
+        <label class="block">
+          <span class="text-sm">File (.xlsx / .xls / .xlsm / .csv)</span>
+          <input id="fileInput" type="file" accept=".xlsx,.xls,.xlsm,.csv" class="mt-1 w-full rounded-xl border px-3 py-2 bg-white" />
+        </label>
+        <label class="block">
+          <span class="text-sm">Text column (optional)</span>
+          <input id="textColumnUpload" class="mt-1 w-full rounded-xl border px-3 py-2" placeholder="e.g., message" />
+        </label>
+      </div>
+      <div class="flex gap-3">
+        <button id="btnUploadProcess" class="px-4 py-2 rounded-xl bg-emerald-600 text-white">Upload & Process</button>
+        <span id="uploadStatus" class="text-sm text-gray-600"></span>
+      </div>
+      <div id="uploadDownloadLink" class="hidden">
+        <a id="downloadLinkUpload" class="text-emerald-700 underline">Download enriched CSV</a>
+      </div>
+    </section>
+
+    <!-- Process Existing Blob -->
+    <section id="tab-existing" class="tab-panel hidden bg-white rounded-2xl shadow p-5 space-y-4">
+      <h3 class="font-semibold">Process an existing blob in <code>incoming/</code></h3>
+      <div class="grid md:grid-cols-2 gap-4">
+        <label class="block">
+          <span class="text-sm">Blob name (must start with <code>incoming/</code>)</span>
+          <input id="blobName" class="mt-1 w-full rounded-xl border px-3 py-2" placeholder="incoming/sample.xlsx" />
+        </label>
+        <label class="block">
+          <span class="text-sm">Text column (optional)</span>
+          <input id="textColumnExisting" class="mt-1 w-full rounded-xl border px-3 py-2" placeholder="e.g., message" />
+        </label>
+      </div>
+      <div class="flex gap-3">
+        <button id="btnProcessExisting" class="px-4 py-2 rounded-xl bg-indigo-600 text-white">Process</button>
+        <span id="existingStatus" class="text-sm text-gray-600"></span>
+      </div>
+      <div id="existingDownloadLink" class="hidden">
+        <a id="downloadLinkExisting" class="text-indigo-700 underline">Download enriched CSV</a>
+      </div>
+    </section>
+
+    <!-- Translate Tester -->
+    <section id="tab-translate" class="tab-panel hidden bg-white rounded-2xl shadow p-5 space-y-4">
+      <h3 class="font-semibold">Translate Tester</h3>
+      <div class="grid md:grid-cols-2 gap-4">
+        <label class="block">
+          <span class="text-sm">Texts (one per line)</span>
+          <textarea id="textsInput" rows="6" class="mt-1 w-full rounded-xl border px-3 py-2"></textarea>
+        </label>
+        <label class="block">
+          <span class="text-sm">Target language</span>
+          <input id="targetLang" value="en" class="mt-1 w-full rounded-xl border px-3 py-2" />
+        </label>
+      </div>
+      <div class="flex gap-3">
+        <button id="btnTranslate" class="px-4 py-2 rounded-xl bg-sky-600 text-white">Translate</button>
+        <span id="translateStatus" class="text-sm text-gray-600"></span>
+      </div>
+      <pre id="translateOutput" class="bg-gray-100 rounded-xl p-3 text-sm overflow-auto"></pre>
+    </section>
+
+    <!-- Logs -->
+    <section class="bg-white rounded-2xl shadow p-5 space-y-3">
+      <h2 class="font-semibold">Logs</h2>
+      <pre id="logs" class="bg-gray-100 rounded-xl p-3 text-xs h-48 overflow-auto"></pre>
+    </section>
+  </div>
+
+  <script>
+    // ----- Tiny helpers -----
+    const $ = (id) => document.getElementById(id);
+    function logln(...args) {
+      const el = $('logs');
+      const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      el.textContent += line + '\n';
+      el.scrollTop = el.scrollHeight;
+      console.log(...args);
+    }
+    function setBusy(el, busy) {
+      if (!el) return;
+      el.disabled = !!busy;
+      el.classList.toggle('opacity-50', !!busy);
+    }
+    function pickBackend() { return ''; } // same-origin
+
+    function filenameFromContentDisposition(h) {
+      if (!h) return null;
+      const m = /filename="?([^\"]+)"?/i.exec(h);
+      return m ? m[1] : null;
+    }
+    function setActiveTab(name) {
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('bg-gray-900', 'text-white'));
+      $(`tab-${name}`).classList.remove('hidden');
+      document.querySelector(`.tab-btn[data-tab="${name}"]`).classList.add('bg-gray-900', 'text-white');
+    }
+    document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => setActiveTab(b.dataset.tab)));
+    setActiveTab('upload'); // default tab
+
+    // ----- Ping backend on load -----
+    (async function pingBackend() {
+      try {
+        const url = '/health';
+        logln('GET', url);
+        const r = await fetch(url);
+        logln('Response', r.status);
+        const j = await r.json().catch(() => null);
+        logln('Body:', j || '(no json body)');
+      } catch (e) {
+        logln('Ping failed:', e.toString());
+      }
+    })();
+
+    // ----- Upload & process (stores in incoming/, writes output to processed/, auto-downloads) -----
+    $('btnUploadProcess').addEventListener('click', async () => {
+      const btn = $('btnUploadProcess');
+      const file = $('fileInput').files[0];
+      const textCol = $('textColumnUpload').value.trim();
+      const status = $('uploadStatus');
+      const dlWrap = $('uploadDownloadLink');
+      const dlA = $('downloadLinkUpload');
+      dlWrap.classList.add('hidden');
+      status.textContent = '';
+      if (!file) {
+        status.textContent = 'Pick a .xlsx/.xls/.xlsm/.csv file.';
+        return;
+      }
+      setBusy(btn, true);
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        if (textCol) fd.append('text_column', textCol);
+        const url = pickBackend() + '/process-upload';
+        logln('POST', url, '(multipart/form-data)', file.name);
+        const resp = await fetch(url, { method: 'POST', body: fd });
+        logln('Response', resp.status);
+        const bodyTxt = await resp.clone().text().catch(() => null);
+        if (!resp.ok) {
+          status.textContent = 'Processing failed';
+          logln('Error body:', bodyTxt || '(no body)');
+          alert('Processing failed: ' + (bodyTxt || resp.statusText));
+          return;
+        }
+        const disp = resp.headers.get('Content-Disposition');
+        const fname = filenameFromContentDisposition(disp) || (file.name.replace(/\.[^.]+$/, '') + '_enriched.csv');
+        const outBlob = await resp.blob();
+        const href = URL.createObjectURL(outBlob);
+
+        // auto-download
+        const a = document.createElement('a');
+        a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
+
+        // also show a persistent link
+        dlA.href = href;
+        dlA.download = fname;
+        dlWrap.classList.remove('hidden');
+        status.textContent = 'Done. File downloaded.';
+        logln('Ready to download:', fname);
+      } catch (e) {
+        status.textContent = 'Error (see logs).';
+        logln('Upload/Process error:', e.toString());
+        alert('Error: ' + e.toString());
+      } finally {
+        setBusy(btn, false);
+      }
+    });
+
+    // ----- Process existing blob (incoming/<file>) -----
+    $('btnProcessExisting').addEventListener('click', async () => {
+      const btn = $('btnProcessExisting');
+      const blobName = $('blobName').value.trim();
+      const textCol = $('textColumnExisting').value.trim();
+      const status = $('existingStatus');
+      const dlWrap = $('existingDownloadLink');
+      const dlA = $('downloadLinkExisting');
+      dlWrap.classList.add('hidden');
+      status.textContent = '';
+      if (!blobName || !blobName.startsWith('incoming/')) {
+        status.textContent = "Provide a blob name like 'incoming/sample.xlsx'.";
+        return;
+      }
+      setBusy(btn, true);
+      try {
+        const q = new URLSearchParams();
+        q.set('blob_name', blobName);
+        if (textCol) q.set('text_column', textCol);
+        const url = pickBackend() + '/process-xlsx?' + q.toString();
+        const resp = await fetch(url, { method: 'POST' });
+        logln('POST', url, resp.status);
+        const bodyTxt = await resp.clone().text().catch(() => null);
+        if (!resp.ok) {
+          status.textContent = 'Processing failed';
+          logln('Error body:', bodyTxt || '(no body)');
+          alert('Processing failed: ' + (bodyTxt || resp.statusText));
+          return;
+        }
+        const disp = resp.headers.get('Content-Disposition');
+        const fname = filenameFromContentDisposition(disp) || (blobName.split('/').pop().replace(/\.[^.]+$/, '') + '_enriched.csv');
+        const outBlob = await resp.blob();
+        const href = URL.createObjectURL(outBlob);
+
+        // auto-download
+        const a = document.createElement('a');
+        a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
+
+        // also show a persistent link
+        dlA.href = href;
+        dlA.download = fname;
+        dlWrap.classList.remove('hidden');
+        status.textContent = 'Done. File downloaded.';
+        logln('Ready to download:', fname);
+      } catch (e) {
+        status.textContent = 'Error (see logs).';
+        logln('Process existing error:', e.toString());
+        alert('Error: ' + e.toString());
+      } finally {
+        setBusy(btn, false);
+      }
+    });
+
+    // ----- Translate tester -----
+    $('btnTranslate').addEventListener('click', async () => {
+      const btn = $('btnTranslate');
+      const out = $('translateOutput');
+      const status = $('translateStatus');
+      out.textContent = '';
+      status.textContent = '';
+      const lines = $('textsInput').value.split('\n').map(s => s.trim()).filter(Boolean);
+      const to = $('targetLang').value.trim() || 'en';
+      if (lines.length === 0) {
+        status.textContent = 'Enter one or more lines.';
+        return;
+      }
+      setBusy(btn, true);
+      try {
+        const url = pickBackend() + '/translate';
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ texts: lines, to })
+        });
+        logln('POST', url, resp.status);
+        const j = await resp.json();
+        if (!resp.ok) throw new Error(JSON.stringify(j));
+        out.textContent = JSON.stringify(j, null, 2);
+        status.textContent = 'OK';
+      } catch (e) {
+        status.textContent = 'Error (see logs).';
+        logln('Translate error:', e.toString());
+      } finally {
+        setBusy(btn, false);
+      }
+    });
+  </script>
+</body>
+</html>

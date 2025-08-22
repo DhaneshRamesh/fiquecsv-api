@@ -6,3 +6,4 @@ openpyxl
 azure-storage-blob
 azure-identity
 gunicorn
+aiofiles
