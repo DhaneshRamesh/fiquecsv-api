@@ -42,14 +42,6 @@ This project is a production-ready pattern that turns a customer-uploaded Excel 
 * **CI/CD**: GitHub Actions for deployment
 * **Secrets**: Managed Identity + App Service Configuration
 
-## 💰 Cost Model
-
-* **Blob Storage** → negligible (<$0.01/month for MBs)
-* **Event Grid** → first 100K ops/month free
-* **Azure Web App** → Basic tier starts at ~$13/month
-* **Translator** → free 2M chars/month, then ~$10 per million
-* **OpenAI (GPT-4o JSON)** → ~$0.002–0.005 per 1K tokens
-* **Power Automate** → free basic tier
 
 ## 📊 Architecture Flow
 
