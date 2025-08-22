@@ -6,12 +6,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <!-- Tailwind (Play CDN) -->
   <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- ====== BACKEND ROUTING ======
+       When opened from your Static Web App domain, calls will go to App Service.
+       When opened from FastAPI /ui locally, it uses same-origin. -->
+  <script>
+    window.BACKEND_BASE =
+      (location.hostname === 'orange-dune-0ea42a603.1.azurestaticapps.net' ||
+       location.hostname.endsWith('.azurestaticapps.net'))
+        ? 'https://fique-csv-cng0ewddbhhwebe8.westeurope-01.azurewebsites.net'
+        : ''; // same-origin for local FastAPI /ui
+    function pickBackend() { return window.BACKEND_BASE; }
+  </script>
 </head>
 <body class="bg-gray-50 text-gray-900">
   <div class="max-w-5xl mx-auto p-6 space-y-6">
     <header class="flex items-center justify-between">
       <h1 class="text-2xl font-bold">Fiquebot – Self-Service Translation & Entity Extraction</h1>
-      <span class="text-xs text-gray-500">Frontend: single-file, same-origin API</span>
+      <span class="text-xs text-gray-500">Frontend: single-file, SWA + App Service ready</span>
     </header>
 
     <!-- Tabs -->
@@ -107,11 +119,9 @@
       el.disabled = !!busy;
       el.classList.toggle('opacity-50', !!busy);
     }
-    function pickBackend() { return ''; } // same-origin
-
     function filenameFromContentDisposition(h) {
       if (!h) return null;
-      const m = /filename="?([^\"]+)"?/i.exec(h);
+      const m = /filename="?([^"]+)"?/i.exec(h);
       return m ? m[1] : null;
     }
     function setActiveTab(name) {
@@ -126,7 +136,7 @@
     // ----- Ping backend on load -----
     (async function pingBackend() {
       try {
-        const url = '/health';
+        const url = pickBackend() + '/health';
         logln('GET', url);
         const r = await fetch(url);
         logln('Response', r.status);
