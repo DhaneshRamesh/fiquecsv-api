@@ -4,7 +4,7 @@ This project is a production-ready pattern that turns a customer-uploaded Excel 
 
 * 🌍 Country
 * 📞 Phone  
-* 📖 Book ("Gyan Ganga" / "Way of Living")
+* 📖 Book 
 * 🏷️ Language mentioned in the text
 
 ## 📐 High-Level Architecture
@@ -69,13 +69,19 @@ Set up environment variables in the Web App configuration:
 - `OPENAI_ENDPOINT` - Your Azure OpenAI service endpoint
 - `TRANSLATOR_ENDPOINT` - Azure Translator service endpoint  
 - `STORAGE_ACCOUNT_NAME` - Blob storage account name
-- `EVENT_GRID_WEBHOOK_URL` - Web App endpoint for Event Grid notifications
+
 
 The GPT-4o model extracts entities in JSON format with fields for country, phone, book, and language.
 
-## 🔧 Monitoring & Troubleshooting
+##UI
+<img width="1270" height="734" alt="image" src="https://github.com/user-attachments/assets/8f798abe-9856-425e-9081-f156a8256098" />
 
-Use Application Insights for web app performance metrics and set up cost analysis alerts. Configure scaling rules for handling multiple file processing requests. Monitor webhook endpoint health for Event Grid integration.
+##Samples
+<img width="1552" height="907" alt="image" src="https://github.com/user-attachments/assets/135efb8a-1976-41bc-95f7-4d657636ead3" />
+
+<img width="1514" height="907" alt="image" src="https://github.com/user-attachments/assets/020969fe-0a8f-4e27-8643-ddf50428e375" />
+
+
 
 ## 📄 License
 
