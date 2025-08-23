@@ -77,7 +77,7 @@ The GPT-4o model extracts entities in JSON format with fields for country, phone
 <img width="1270" height="734" alt="image" src="https://github.com/user-attachments/assets/8f798abe-9856-425e-9081-f156a8256098" />
 
 ##Samples
-<img width="1552" height="907" alt="image" src="https://github.com/user-attachments/assets/135efb8a-1976-41bc-95f7-4d657636ead3" />
+<img width="1440" height="900" alt="image" src="https://github.com/user-attachments/assets/97dba8dd-4cf2-4ae3-80cc-fbcbc7691541" />
 
 <img width="1514" height="907" alt="image" src="https://github.com/user-attachments/assets/020969fe-0a8f-4e27-8643-ddf50428e375" />
 
