@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fiquebot")
 
 # ----------------------------- App init -----------------------------
-app = FastAPI(title="Fiquebot API", version="1.0.0")
+app = FastAPI(title="Fiquebot API", version="1.1.0")
 
 # ----------------------------- CORS -----------------------------
 # Allow local dev and a placeholder for Azure Static Web Apps.
@@ -75,6 +75,87 @@ def _require(cond: bool, msg: str):
     if not cond:
         raise HTTPException(500, msg)
 
+# ----------------------------- Dialing codes (lightweight mapping + NANP group) -----------------------------
+_NANP = {
+    "united states", "united states of america", "usa", "canada",
+    "bahamas", "barbados", "bermuda", "jamaica", "dominican republic", "haiti",
+    "trinidad and tobago", "puerto rico", "grenada", "saint lucia",
+    "antigua and barbuda", "saint kitts and nevis", "saint vincent and the grenadines",
+    "anguilla", "cayman islands", "turks and caicos islands", "dominica",
+    "british virgin islands", "us virgin islands", "guam", "northern mariana islands"
+}
+_COUNTRY_TO_DIAL = {
+    # Core/likely dataset countries
+    "india": "+91", "kenya": "+254", "nepal": "+977", "bangladesh": "+880", "pakistan": "+92",
+    "sri lanka": "+94", "australia": "+61", "new zealand": "+64", "united kingdom": "+44", "uk": "+44",
+    "england": "+44", "ireland": "+353", "south africa": "+27", "nigeria": "+234", "ghana": "+233",
+    "tanzania": "+255", "uganda": "+256", "rwanda": "+250", "ethiopia": "+251", "zambia": "+260",
+    "zimbabwe": "+263", "botswana": "+267", "namibia": "+264", "morocco": "+212", "tunisia": "+216",
+    "algeria": "+213", "egypt": "+20", "saudi arabia": "+966", "united arab emirates": "+971", "uae": "+971",
+    "qatar": "+974", "oman": "+968", "bahrain": "+973", "iran": "+98", "iraq": "+964", "turkey": "+90",
+    "israel": "+972", "jordan": "+962", "lebanon": "+961",
+    "china": "+86", "japan": "+81", "south korea": "+82", "korea, republic of": "+82", "north korea": "+850",
+    "hong kong": "+852", "macau": "+853", "taiwan": "+886", "vietnam": "+84", "thailand": "+66",
+    "laos": "+856", "cambodia": "+855", "malaysia": "+60", "singapore": "+65", "indonesia": "+62",
+    "philippines": "+63", "myanmar": "+95", "brunei": "+673", "mongolia": "+976", "afghanistan": "+93",
+    "france": "+33", "germany": "+49", "italy": "+39", "spain": "+34", "portugal": "+351",
+    "netherlands": "+31", "belgium": "+32", "luxembourg": "+352", "switzerland": "+41", "austria": "+43",
+    "poland": "+48", "czech republic": "+420", "czechia": "+420", "slovakia": "+421", "hungary": "+36",
+    "romania": "+40", "bulgaria": "+359", "greece": "+30", "croatia": "+385", "slovenia": "+386",
+    "serbia": "+381", "bosnia and herzegovina": "+387", "north macedonia": "+389", "albania": "+355",
+    "iceland": "+354", "norway": "+47", "sweden": "+46", "finland": "+358", "denmark": "+45",
+    "estonia": "+372", "latvia": "+371", "lithuania": "+370", "ukraine": "+380", "belarus": "+375",
+    "moldova": "+373", "georgia": "+995", "armenia": "+374", "azerbaijan": "+994", "russia": "+7", "kazakhstan": "+7",
+    "mexico": "+52", "guatemala": "+502", "belize": "+501", "honduras": "+504", "el salvador": "+503",
+    "nicaragua": "+505", "costa rica": "+506", "panama": "+507", "colombia": "+57", "venezuela": "+58",
+    "ecuador": "+593", "peru": "+51", "bolivia": "+591", "paraguay": "+595", "chile": "+56",
+    "argentina": "+54", "uruguay": "+598", "brazil": "+55", "cuba": "+53", "dominican republic": "+1",
+    "jamaica": "+1", "trinidad and tobago": "+1", "barbados": "+1", "bahamas": "+1",
+    "canada": "+1", "united states": "+1", "united states of america": "+1", "usa": "+1",
+}
+
+# Prefixed list for phone-based inference (sorted by length desc to prefer longest match)
+_DIAL_PREFIXES = sorted({v.replace("+", "").replace("-", "") for v in _COUNTRY_TO_DIAL.values()},
+                        key=lambda x: (-len(x), x))
+def _norm_country(name: str) -> str:
+    s = (name or "").strip().lower()
+    # small canonicalizations
+    s = s.replace("&", "and")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def country_to_dial(country: str, phone: str = "") -> str:
+    """Return +<code> from country; fallback to inferring from phone if present."""
+    if not country and phone:
+        code = _infer_from_phone(phone)
+        return f"+{code}" if code else ""
+    s = _norm_country(country)
+    if s in _NANP:
+        return "+1"
+    if s in _COUNTRY_TO_DIAL:
+        return _COUNTRY_TO_DIAL[s]
+    # loose NANP heuristics
+    if any(k in s for k in ["usa", "united states"]):
+        return "+1"
+    # fallback: try phone
+    if phone:
+        code = _infer_from_phone(phone)
+        return f"+{code}" if code else ""
+    return ""
+
+def _infer_from_phone(phone: str) -> str:
+    """Pick the longest matching country calling prefix from a phone string like '+97150...' or '0091...'."""
+    if not phone:
+        return ""
+    digits = re.sub(r"[^\d]", "", phone)
+    if phone.strip().startswith("00"):
+        digits = digits[2:]  # strip IDD 00
+    # if it started with +, digits already stripped '+'
+    for pref in _DIAL_PREFIXES:
+        if digits.startswith(pref):
+            return pref
+    return ""
+
 # ----------------------------- Blob helpers -----------------------------
 def get_blob_client() -> BlobServiceClient:
     _require(STORAGE_ACCOUNT, "Storage account not configured")
@@ -94,17 +175,20 @@ def ensure_container(blob_service: BlobServiceClient, name: str):
     except ResourceExistsError:
         pass  # already exists
 
-# ----------------------------- Core helpers -----------------------------
-def translate_texts(texts: List[str], to_lang: str = "en") -> List[str]:
+# ----------------------------- Translation helpers (with language detection) -----------------------------
+def translate_and_detect(texts: List[str], to_lang: str = "en") -> List[dict]:
+    """
+    Returns list of dicts: {'translated': str, 'lang': 'xx', 'confidence': float}
+    Uses Microsoft Translator /translate, which includes detectedLanguage.
+    """
     _require(TRN_EP and TRN_KEY and TRN_REGION, "Translator not configured")
-    log.info({"op": "translate-input", "count": len(texts)})
     url = f"{TRN_EP}/translate?api-version=3.0&to={to_lang}"
     headers = {
         "Ocp-Apim-Subscription-Key": TRN_KEY,
         "Ocp-Apim-Subscription-Region": TRN_REGION,
         "Content-Type": "application/json",
     }
-    out: List[str] = []
+    out: List[dict] = []
     for i in range(0, len(texts), 50):  # batch
         batch = texts[i : i + 50]
         payload = [{"Text": t or ""} for t in batch]
@@ -112,18 +196,34 @@ def translate_texts(texts: List[str], to_lang: str = "en") -> List[str]:
             r = h.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
-        out.extend([item["translations"][0]["text"] for item in data])
+        for item in data:
+            t_en = item["translations"][0]["text"]
+            det = item.get("detectedLanguage") or {}
+            lang = det.get("language", "") or ""
+            conf = float(det.get("score", det.get("confidence", 0)) or 0)
+            out.append({"translated": t_en, "lang": lang, "confidence": conf})
     return out
 
+def translate_texts(texts: List[str], to_lang: str = "en") -> List[str]:
+    """
+    Back-compat thin wrapper: returns only translated strings.
+    """
+    res = translate_and_detect(texts, to_lang=to_lang)
+    return [r["translated"] for r in res]
+
+# ----------------------------- Entity extraction -----------------------------
 def extract_entities(text: str) -> dict:
     _require(AOAI_EP and AOAI_KEY and AOAI_DEP, "Azure OpenAI not configured")
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
     headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
+    # Clean text to avoid control chars confusing LLM
+    cleaned = "".join(c for c in text if c.isprintable() or c.isspace())
     prompt = f"""
-    Extract entities from the following text and return them as JSON with fields: country, phone, book, language_mentioned, address.
+    Extract entities from the following text and return them as JSON with fields:
+    country, phone, book, language_mentioned, address.
     Book must be either "Gyan Ganga", "Way of Living", or empty string "".
     Use empty string "" for any field not found.
-    Text: {text}
+    Text: {cleaned}
     Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}}
     """
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 200, "temperature": 0.3}
@@ -134,9 +234,10 @@ def extract_entities(text: str) -> dict:
     try:
         return json.loads(j["choices"][0]["message"]["content"])
     except Exception:
-        log.error({"op": "parse-failed", "text": text[:120]})
+        log.error({"op": "parse-failed", "sample": cleaned[:120]})
         return {"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}
 
+# ----------------------------- IO helpers -----------------------------
 def _read_dataframe_from_bytes(name: str, content: bytes) -> pd.DataFrame:
     try:
         if name.lower().endswith(".csv"):
@@ -145,6 +246,7 @@ def _read_dataframe_from_bytes(name: str, content: bytes) -> pd.DataFrame:
     except Exception as e:
         raise HTTPException(400, f"Failed to read '{name}': {str(e)}") from e
 
+# ----------------------------- Core processing -----------------------------
 def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id: Optional[str] = None) -> Tuple[bytes, str]:
     """
     Reads from incoming/<file>, writes enriched CSV to processed/<file>_enriched.csv,
@@ -180,34 +282,76 @@ def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id
     valid_texts = series[mask].astype(str).tolist()
     log.info({"op": "filtered-texts", "count": len(valid_texts), "column": col, "req_id": req_id})
 
+    # Allocate full-size columns for language/translation QA
+    source_lang_full: List[str] = [""] * len(df)
+    trans_conf_full: List[float] = [0.0] * len(df)
+    was_translated_full: List[bool] = [False] * len(df)
+    needs_review_full: List[bool] = [False] * len(df)
+
     if valid_texts:
-        translated = translate_texts(valid_texts, to_lang="en")
-        rows, valid_translations, valid_row_indices = [], [], []
-        for i, t in enumerate(translated):
+        # translate with detection
+        trans_results = translate_and_detect(valid_texts, to_lang="en")
+        rows = []
+        valid_translations = []
+        valid_row_indices = []
+        for i, res in enumerate(trans_results):
+            t_en = res["translated"]
+            lang = (res["lang"] or "").lower()
+            conf = float(res["confidence"] or 0.0)
+
+            src_idx = valid_indices[i]
+            source_lang_full[src_idx] = lang
+            trans_conf_full[src_idx] = conf
+
+            # was translation applied?
+            orig_text = series.iloc[src_idx]
+            was_trans = lang != "en"
+            # light QA heuristic: if translated and detector confidence low, flag review
+            needs_review = bool(was_trans and conf < 0.60)
+
+            was_translated_full[src_idx] = was_trans
+            needs_review_full[src_idx] = needs_review
+
             try:
-                entities = extract_entities(t)
+                entities = extract_entities(t_en)
                 if any(entities.get(k, "") for k in ("country", "phone", "book", "language_mentioned", "address")):
                     rows.append(entities)
-                    valid_translations.append(t)
-                    valid_row_indices.append(valid_indices[i])
+                    valid_translations.append(t_en)
+                    valid_row_indices.append(src_idx)
             except Exception:
-                log.exception({"op": "extract-failed", "text": t[:120], "req_id": req_id})
-        # pad to length
+                log.exception({"op": "extract-failed", "text": str(t_en)[:120], "req_id": req_id})
+
+        # pad entities to frame length in original positions
         full_rows = [{"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""} for _ in range(len(df))]
         for i, idx in enumerate(valid_row_indices):
             if i < len(rows):
                 full_rows[idx] = rows[i]
-        translated_full = ["" for _ in range(len(df))]
+
+        translated_full = [""] * len(df)
         for i, idx in enumerate(valid_row_indices):
             translated_full[idx] = valid_translations[i] if i < len(valid_translations) else ""
     else:
-        translated_full = ["" for _ in range(len(df))]
+        translated_full = [""] * len(df)
         full_rows = [{"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""} for _ in range(len(df))]
 
     # Build output DataFrame
     edf = df.copy()
     edf["translated_en"] = translated_full
+    edf["source_lang"] = source_lang_full
+    edf["translation_confidence"] = trans_conf_full
+    edf["was_translated"] = was_translated_full
+    edf["translation_needs_review"] = needs_review_full
+
     ents_df = pd.DataFrame(full_rows, index=df.index)
+
+    # Add dialing_code based on the extracted country (fallback from phone if possible)
+    dialing_codes: List[str] = []
+    for idx in ents_df.index:
+        ctry = str(ents_df.at[idx, "country"] or "")
+        ph = str(ents_df.at[idx, "phone"] or "")
+        dialing_codes.append(country_to_dial(ctry, ph))
+    ents_df["dialing_code"] = dialing_codes
+
     out_df = pd.concat([edf, ents_df], axis=1)
 
     # Serialize CSV
@@ -251,6 +395,7 @@ async def debug_env():
 async def translate_api(payload: dict):
     """
     payload: { 'texts': ['...', '...'], 'to': 'en' }
+    - keeps the old response shape for compatibility
     """
     req_id = uuid.uuid4().hex[:8]
     texts = payload.get("texts") or []
