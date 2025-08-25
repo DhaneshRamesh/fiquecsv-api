@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fiquebot")
 
 # ----------------------------- App init -----------------------------
-app = FastAPI(title="Fiquebot API", version="1.3.0")
+app = FastAPI(title="Fiquebot API", version="1.3.1")
 
 # ----------------------------- CORS -----------------------------
 # Allow local dev and a placeholder for Azure Static Web Apps.
@@ -405,9 +405,14 @@ def _read_dataframe_from_bytes(name: str, content: bytes) -> pd.DataFrame:
 
     df.columns = [str(c) if c is not None else "" for c in df.columns]
     try:
-        df = df.applymap(lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else str(x)))
+        # pandas 2.3: DataFrame.applymap deprecated in favor of DataFrame.map
+        df = df.map(lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else str(x)))
     except Exception:
         pass
+
+    if len(df.columns) == 1:
+        # Single column is our text already
+        return df
 
     if len(df.columns) == 0:
         df["text"] = ""
@@ -426,9 +431,16 @@ def _choose_text_column(df: pd.DataFrame, requested: Optional[str]) -> str:
     df["__synthetic_text__"] = df.astype(str).apply(lambda r: " ".join([v for v in r.values if v and v != "nan"]), axis=1)
     return "__synthetic_text__"
 
-def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Optional[str] = None, req_id: Optional[str] = None, provider: Optional[str] = None) -> Tuple[bytes, str]:
+def process_excel_blob_from_bytes(
+    name: str,
+    content: bytes,
+    text_column: Optional[str] = None,
+    req_id: Optional[str] = None,
+    provider: Optional[str] = None
+) -> Tuple[bytes, str]:
     """
     Process a file already in-memory and return (csv_bytes, suggested_name).
+    Now does safe batching to avoid worker timeouts / OOM.
     """
     df = _read_dataframe_from_bytes(name, content)
     col = _choose_text_column(df, text_column)
@@ -444,43 +456,53 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
     trans_conf_full: List[float] = [0.0] * n
     was_translated_full: List[bool] = [False] * n
     needs_review_full: List[bool] = [False] * n
-
     translated_full = [""] * n
     full_rows = [{"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""} for _ in range(n)]
 
     if valid_texts:
-        # LLM primary with MS fallback handled inside translate_and_detect
-        trans_results = translate_and_detect(valid_texts, to_lang="en", provider=provider)
-        for i, res in enumerate(trans_results):
-            t_en = res.get("translated", "")
-            lang = (res.get("lang", "") or "").lower()
-            conf = float(res.get("confidence") or 0.0)
-
-            src_idx = valid_indices[i]
-            source_lang_full[src_idx] = lang
-            trans_conf_full[src_idx] = conf
-
-            was_trans = bool(lang and lang != "en")
-            needs_review = bool(was_trans and conf < 0.60)
-            was_translated_full[src_idx] = was_trans
-            needs_review_full[src_idx] = needs_review
-
-            translated_full[src_idx] = t_en
+        BATCH = int(os.environ.get("LLM_MAX_BATCH", "200"))  # smaller batches = safer; env-configurable
+        for start in range(0, len(valid_texts), BATCH):
+            end = min(start + BATCH, len(valid_texts))
+            chunk = valid_texts[start:end]
+            chunk_idx = valid_indices[start:end]
+            log.info({"op": "llm-chunk", "start": start, "end": end, "size": len(chunk), "req_id": req_id})
 
             try:
-                entities = extract_entities(t_en)
+                trans_results = translate_and_detect(chunk, to_lang="en", provider=provider)
             except Exception as e:
-                log.warning({"op": "extract-catch", "error": str(e), "req_id": req_id})
-                entities = {"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}
+                log.warning({"op": "translate-chunk-failed", "error": str(e), "req_id": req_id})
+                trans_results = [{"translated": t, "lang": "en", "confidence": 0.0} for t in chunk]
 
-            full_rows[src_idx] = {
-                "country": entities.get("country", ""),
-                "phone": entities.get("phone", ""),
-                "book": entities.get("book", ""),
-                "language_mentioned": entities.get("language_mentioned", ""),
-                "address": entities.get("address", ""),
-            }
+            for i, res in enumerate(trans_results):
+                src_idx = chunk_idx[i]
+                t_en = res.get("translated", "")
+                lang = (res.get("lang", "") or "").lower()
+                conf = float(res.get("confidence") or 0.0)
 
+                source_lang_full[src_idx] = lang
+                trans_conf_full[src_idx] = conf
+
+                was_trans = bool(lang and lang != "en")
+                needs_review = bool(was_trans and conf < 0.60)
+                was_translated_full[src_idx] = was_trans
+                needs_review_full[src_idx] = needs_review
+                translated_full[src_idx] = t_en
+
+                try:
+                    entities = extract_entities(t_en)
+                except Exception as e:
+                    log.warning({"op": "extract-chunk-failed", "error": str(e), "req_id": req_id})
+                    entities = {"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}
+
+                full_rows[src_idx] = {
+                    "country": entities.get("country", ""),
+                    "phone": entities.get("phone", ""),
+                    "book": entities.get("book", ""),
+                    "language_mentioned": entities.get("language_mentioned", ""),
+                    "address": entities.get("address", ""),
+                }
+
+    # Final dataframe assembly
     edf = df.copy()
     edf["translated_en"] = translated_full
     edf["source_lang"] = source_lang_full
@@ -507,7 +529,12 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
     processed_filename = base.rsplit(".", 1)[0] + "_enriched.csv"
     return out_bytes, processed_filename
 
-def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id: Optional[str] = None, provider: Optional[str] = None) -> Tuple[bytes, str]:
+def process_excel_blob(
+    blob_name: str,
+    text_column: Optional[str] = None,
+    req_id: Optional[str] = None,
+    provider: Optional[str] = None
+) -> Tuple[bytes, str]:
     """
     Reads from incoming/<file>, writes enriched CSV to processed/<file>_enriched.csv if storage is available.
     """
