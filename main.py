@@ -15,12 +15,15 @@ from azure.core.exceptions import ResourceExistsError
 # Excel streaming
 from openpyxl import load_workbook
 
+# offload heavy sync steps to a thread so the event loop stays alive
+import anyio
+
 # ----------------------------- Logging -----------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fiquebot")
 
 # ----------------------------- App init -----------------------------
-app = FastAPI(title="Fiquebot API", version="2.0.0")
+app = FastAPI(title="Fiquebot API", version="2.0.1")
 
 # ----------------------------- CORS -----------------------------
 _default_origins = [
@@ -61,22 +64,17 @@ TRN_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
 TRN_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "westeurope")
 
 AOAI_EP = (os.environ.get("AZURE_OPENAI_ENDPOINT", "") or "").rstrip("/")
-AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")  # keep your deployment name
+AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
 AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
-# Translation provider selection
-TRANSLATE_PROVIDER = os.environ.get("TRANSLATE_PROVIDER", "llm").lower()  # "llm" (default) or "ms"
-LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "100"))  # smaller batch -> lower peak RAM
+TRANSLATE_PROVIDER = os.environ.get("TRANSLATE_PROVIDER", "llm").lower()  # "llm" | "ms"
+LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "80"))  # slightly smaller to reduce peak memory
 LLM_SYS = "Return ONLY JSON Lines, one object per line. No commentary."
 ENTITY_CONF_THRESHOLD = float(os.environ.get("ENTITY_CONF_THRESHOLD", "0.60"))
-
-# Pandas CSV chunk size
 CSV_CHUNK = int(os.environ.get("CSV_CHUNK", "10000"))
-
-# Gunicorn note: set a higher timeout when needed, e.g. --timeout 300 in appCommandLine
 
 # ----------------------------- Small utils -----------------------------
 def _soft_require(cond: bool, msg: str) -> bool:
@@ -88,7 +86,7 @@ def _soft_require(cond: bool, msg: str) -> bool:
 def is_truthy(s: Optional[str]) -> bool:
     return str(s or "").strip().lower() in {"1", "true", "yes", "y"}
 
-# ----------------------------- Dialing codes (lightweight mapping + NANP group) -----------------------------
+# ----------------------------- Dialing codes -----------------------------
 _NANP = {
     "united states", "united states of america", "usa", "canada",
     "bahamas", "barbados", "bermuda", "jamaica", "dominican republic", "haiti",
@@ -186,14 +184,11 @@ def ensure_container(blob_service: BlobServiceClient, name: str):
         log.warning({"op": "container-create-skip", "name": name, "error": str(e)})
 
 # ----------------------------- HTTP helpers -----------------------------
-def httpx_client(timeout: int = 120) -> httpx.Client:
+def httpx_client(timeout: int = 90) -> httpx.Client:
     return httpx.Client(timeout=timeout)
 
 # ----------------------------- Translator (MS) -----------------------------
 def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict]:
-    """
-    Returns [{'translated': str, 'lang': 'xx', 'confidence': float}, ...]
-    """
     if not (TRN_EP and TRN_KEY and TRN_REGION):
         return [{"translated": t or "", "lang": "en", "confidence": 1.0} for t in texts]
 
@@ -208,7 +203,7 @@ def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict
         batch = texts[i : i + 50]
         payload = [{"Text": t or ""} for t in batch]
         try:
-            with httpx_client(120) as h:
+            with httpx_client(90) as h:
                 r = h.post(url, headers=headers, json=payload)
                 r.raise_for_status()
                 data = r.json()
@@ -224,7 +219,7 @@ def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict
     return out
 
 # ----------------------------- LLM batched (Azure OpenAI) -----------------------------
-def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3500) -> List[Dict[str, Any]]:
+def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3300) -> List[Dict[str, Any]]:
     if not (AOAI_EP and AOAI_KEY and AOAI_DEP):
         raise RuntimeError("LLM not configured")
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
@@ -237,10 +232,9 @@ def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3500)
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    # Retry/backoff
     for attempt in range(5):
         try:
-            with httpx_client(180) as h:
+            with httpx_client(120) as h:
                 r = h.post(url, headers=headers, json=body)
                 r.raise_for_status()
                 j = r.json()
@@ -262,18 +256,12 @@ def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3500)
     raise RuntimeError("LLM call failed after retries")
 
 def _batch_rows_to_lines(rows: List[Dict[str, Any]]) -> str:
-    # escape gently
     def esc(s: str) -> str:
         s = (s or "").replace("\\", "\\\\").replace('"', '\\"')
         return s
     return "\n".join([f'- id="{r["id"]}" text="{esc(r["text"])}"' for r in rows])
 
 def llm_translate_and_extract_batch(texts: List[str], to_lang: str = "en") -> List[dict]:
-    """
-    Single LLM call that both translates and extracts entities.
-    Output JSONL per line:
-      {"id":0,"translated":"...","lang":"hi","confidence":0.98,"country":"..","phone":"..","book":"..","language_mentioned":"..","address":".."}
-    """
     rows = [{"id": i, "text": (t or "")} for i, t in enumerate(texts)]
     lines = _batch_rows_to_lines(rows)
     prompt = f"""
@@ -282,24 +270,16 @@ You are a professional translator and information extractor.
 For each input row:
 1) Detect language of "text".
 2) Translate "text" to {to_lang}.
-3) Extract simple entities from the *translated* English text:
-   - country
-   - phone
-   - book (must be "Gyan Ganga", "Way of Living", or "" if none)
-   - language_mentioned
-   - address
+3) Extract entities from the translated English text:
+   - country, phone, book ("Gyan Ganga"|"Way of Living"|""), language_mentioned, address
 
-Output exactly one JSON object per input row (JSONL). Keys per line:
-id (int), translated (str), lang (str), confidence (0..1),
-country (str), phone (str), book (str), language_mentioned (str), address (str).
+Output exactly one JSON object per input row (JSONL).
+Keys: id, translated, lang, confidence, country, phone, book, language_mentioned, address.
 
 Rows:
 {lines}
-
-Example format only (values are illustrative):
-{{"id":0,"translated":"...","lang":"hi","confidence":0.97,"country":"India","phone":"+91 98...","book":"Gyan Ganga","language_mentioned":"Hindi","address":"..."}}"""
-    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=3500)
-    # align to inputs
+"""
+    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=3300)
     out_map = {int(o.get("id", -1)): o for o in output if "id" in o}
     aligned: List[dict] = []
     for i, t in enumerate(texts):
@@ -317,11 +297,6 @@ Example format only (values are illustrative):
     return aligned
 
 def llm_entities_only_batch(texts_en: List[str]) -> List[dict]:
-    """
-    Entities only (for when MS handled translation).
-    Output JSONL per line:
-      {"id":0,"country":"..","phone":"..","book":"..","language_mentioned":"..","address":".."}
-    """
     rows = [{"id": i, "text": (t or "")} for i, t in enumerate(texts_en)]
     lines = _batch_rows_to_lines(rows)
     prompt = f"""
@@ -333,7 +308,7 @@ Return one JSON object per line with keys: id,country,phone,book,language_mentio
 Rows:
 {lines}
 """
-    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=3000)
+    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=2800)
     out_map = {int(o.get("id", -1)): o for o in output if "id" in o}
     aligned: List[dict] = []
     for i in range(len(texts_en)):
@@ -349,20 +324,11 @@ Rows:
 
 # ----------------------------- Unified translation dispatcher -----------------------------
 def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Optional[str] = None) -> List[dict]:
-    """
-    If provider == "llm": single call returns translation + entities.
-    If provider == "ms": MS translate + LLM entities.
-    If None: env TRANSLATE_PROVIDER.
-    Returns list of rows with at least keys:
-      translated, lang, confidence, country, phone, book, language_mentioned, address
-    """
     prov = (provider or TRANSLATE_PROVIDER or "llm").lower()
 
     if prov == "ms":
-        # 1) Translate w/ MS in small slices
         trans = _translate_and_detect_ms(texts, to_lang=to_lang)
         translated = [r.get("translated", "") for r in trans]
-        # 2) Entities via LLM (batched) in slices of LLM_MAX_BATCH
         ents_full: List[dict] = []
         for i in range(0, len(translated), LLM_MAX_BATCH):
             part = translated[i:i + LLM_MAX_BATCH]
@@ -388,7 +354,6 @@ def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Option
             })
         return out
 
-    # prov == "llm": single-step
     out_full: List[dict] = []
     for i in range(0, len(texts), LLM_MAX_BATCH):
         batch = texts[i:i + LLM_MAX_BATCH]
@@ -406,20 +371,14 @@ def choose_text_col_from_header(headers: List[str], requested: Optional[str]) ->
         for idx, h in enumerate(headers):
             if h == requested or h.strip().lower() == requested.strip().lower():
                 return idx
-    # candidates
     lowered = [h.strip().lower() for h in headers]
     for i, h in enumerate(lowered):
         if h in TEXT_COL_CANDIDATES:
             return i
-    # else fallback first col
     return 0 if headers else 0
 
 # ----------------------------- Streaming readers -----------------------------
 def iter_csv_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]]:
-    """
-    Yields rows (list of strings) for CSV using pandas chunks.
-    Also yields header first.
-    """
     first = True
     for chunk in pd.read_csv(
         path,
@@ -429,23 +388,17 @@ def iter_csv_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]]:
         on_bad_lines="skip",
         engine="python",
     ):
-        # Ensure string columns
         for c in chunk.columns:
             chunk[c] = chunk[c].astype(str).fillna("")
         if first:
             headers = [str(c) if c is not None else "" for c in chunk.columns.tolist()]
-            yield headers  # header row indicator
-            # remember text col name normalized
+            yield headers
             first = False
         for _, row in chunk.iterrows():
             yield [row.get(c, "") for c in chunk.columns]
         del chunk; gc.collect()
 
 def iter_excel_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]]:
-    """
-    Yields rows (list of strings) using openpyxl read_only=True.
-    Also yields header first (assumes first row is header).
-    """
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb.active
@@ -462,12 +415,10 @@ def iter_excel_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]
         yield headers
         for r in rows:
             vals = [(v if v is not None else "") for v in (r or [])]
-            # pad to header length
             if len(vals) < len(headers):
                 vals = list(vals) + [""] * (len(headers) - len(vals))
             else:
                 vals = list(vals[:len(headers)])
-            # cast to string
             vals = [str(v) if v is not None else "" for v in vals]
             yield vals
     finally:
@@ -481,37 +432,26 @@ def process_rows_streaming(
     provider: Optional[str],
     outfile: io.TextIOBase,
 ):
-    """
-    rows_iter yields: first item is header (list of str), then data rows.
-    Writes output CSV to outfile using csv.writer with added columns:
-      translated_en, source_lang, translation_confidence, was_translated, translation_needs_review,
-      country, phone, book, language_mentioned, address, dialing_code
-    """
     writer = csv.writer(outfile, lineterminator="\n")
     header = next(rows_iter, None)
     if header is None:
-        # empty file
         writer.writerow(["text","translated_en","source_lang","translation_confidence","was_translated",
                          "translation_needs_review","country","phone","book","language_mentioned","address","dialing_code"])
         return
 
-    # Normalize header names
     header = [str(h) if h is not None else "" for h in header]
     writer.writerow(header + ["translated_en","source_lang","translation_confidence","was_translated",
                               "translation_needs_review","country","phone","book","language_mentioned","address","dialing_code"])
 
     text_col_idx = choose_text_col_from_header(header, requested_text_col)
 
-    # batch buffer
     buf_rows: List[List[str]] = []
     buf_texts: List[str] = []
 
     def flush_batch():
         if not buf_rows:
             return
-        # translate + extract entities
         results = translate_and_detect(buf_texts, to_lang=to_lang, provider=provider)
-        # write out
         for original_row, res in zip(buf_rows, results):
             t_en = res.get("translated","")
             lang = (res.get("lang","") or "").lower()
@@ -531,12 +471,10 @@ def process_rows_streaming(
                 "true" if needs_review else "false",
                 country, phone, book, language_mentioned, address, dial
             ])
-        # clear batch memory
         buf_rows.clear(); buf_texts.clear()
         gc.collect()
 
     for row in rows_iter:
-        # normalize length
         if len(row) < len(header):
             row = list(row) + [""] * (len(header) - len(row))
         else:
@@ -544,11 +482,9 @@ def process_rows_streaming(
         text = str(row[text_col_idx] or "").strip()
         buf_rows.append(row)
         buf_texts.append(text)
-
         if len(buf_rows) >= LLM_MAX_BATCH:
             flush_batch()
 
-    # final flush
     flush_batch()
 
 # ----------------------------- File helpers -----------------------------
@@ -568,20 +504,12 @@ def guess_ext(name: str) -> str:
     if nl.endswith(".xls"): return ".xls"
     return os.path.splitext(nl)[1] or ".csv"
 
-# ----------------------------- Top-level processors -----------------------------
 def process_local_file_to_csv(in_path: str, original_name: str, text_column: Optional[str], provider: Optional[str]) -> str:
-    """
-    Reads local file (CSV or Excel) streaming, writes a temp CSV with enriched columns.
-    Returns path to output CSV.
-    """
     ext = guess_ext(original_name)
     out_fd, out_path = tempfile.mkstemp(prefix="enriched_", suffix=".csv")
     os.close(out_fd)
     with open(out_path, "w", encoding="utf-8", newline="") as out_io:
-        if ext == ".csv":
-            rows = iter_csv_rows(in_path, text_column)
-        else:
-            rows = iter_excel_rows(in_path, text_column)
+        rows = iter_csv_rows(in_path, text_column) if ext == ".csv" else iter_excel_rows(in_path, text_column)
         process_rows_streaming(rows_iter=rows, requested_text_col=text_column, to_lang="en", provider=provider, outfile=out_io)
     return out_path
 
@@ -616,11 +544,6 @@ async def debug_env():
 
 @app.post("/translate")
 async def translate_api(payload: dict):
-    """
-    payload: { 'texts': ['...', '...'], 'to': 'en', 'provider': 'llm'|'ms' }
-    - LLM: one call does translation + entities
-    - MS: translate via MS, then LLM entities
-    """
     req_id = uuid.uuid4().hex[:8]
     texts = payload.get("texts") or []
     to = payload.get("to", "en")
@@ -628,7 +551,8 @@ async def translate_api(payload: dict):
     if not isinstance(texts, list) or len(texts) == 0:
         raise HTTPException(400, "Provide texts: []")
     t0 = time.time()
-    out = translate_and_detect([str(x) for x in texts], to_lang=to, provider=provider)
+    # do the heavy work off the event loop
+    out = await anyio.to_thread.run_sync(lambda: translate_and_detect([str(x) for x in texts], to_lang=to, provider=provider))
     log.info({"op": "translate", "n": len(texts), "ms": int((time.time() - t0) * 1000), "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
     return {"rows": out}
 
@@ -638,10 +562,6 @@ async def process_xlsx(
     text_column: Optional[str] = Query(None),
     provider: Optional[str] = Query(None)
 ):
-    """
-    Process a file that ALREADY exists in 'incoming/' and return the enriched CSV (streamed).
-    Also uploads to 'processed/'.
-    """
     req_id = uuid.uuid4().hex[:8]
     if not blob_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")) or not blob_name.startswith("incoming/"):
         raise HTTPException(400, "Provide valid blob_name (e.g., 'incoming/sample.xlsx' or 'incoming/sample.csv')")
@@ -653,28 +573,30 @@ async def process_xlsx(
     ensure_container(blob_service, "incoming")
     ensure_container(blob_service, "processed")
 
-    # Download incoming blob to a temp file (stream)
     in_tmp_fd, in_tmp_path = tempfile.mkstemp(prefix="incoming_", suffix=os.path.splitext(blob_name)[1])
     os.close(in_tmp_fd)
     try:
-        in_client = blob_service.get_blob_client(container="incoming", blob=blob_name.replace("incoming/", ""))
-        log.info({"op": "blob-download-start", "blob": blob_name, "req_id": req_id})
-        with open(in_tmp_path, "wb") as fh:
-            downloader = in_client.download_blob()
-            downloader.readinto(fh)
-        log.info({"op": "blob-download-complete", "blob": blob_name, "bytes": os.path.getsize(in_tmp_path), "req_id": req_id})
+        # Download in a worker thread to avoid blocking the loop
+        def _download():
+            in_client = blob_service.get_blob_client(container="incoming", blob=blob_name.replace("incoming/", ""))
+            log.info({"op": "blob-download-start", "blob": blob_name, "req_id": req_id})
+            with open(in_tmp_path, "wb") as fh:
+                downloader = in_client.download_blob()
+                downloader.readinto(fh)
+            log.info({"op": "blob-download-complete", "blob": blob_name, "bytes": os.path.getsize(in_tmp_path), "req_id": req_id})
 
-        # Process to CSV (streaming) -> temp out file
+        await anyio.to_thread.run_sync(_download)
+
+        # Process file -> temp CSV (thread)
         t0 = time.time()
-        out_path = process_local_file_to_csv(in_tmp_path, original_name=blob_name, text_column=text_column, provider=provider)
+        out_path = await anyio.to_thread.run_sync(lambda: process_local_file_to_csv(in_tmp_path, original_name=blob_name, text_column=text_column, provider=provider))
         ms = int((time.time() - t0) * 1000)
         processed_filename = os.path.basename(blob_name).rsplit(".", 1)[0] + "_enriched.csv"
         log.info({"op": "process-xlsx", "blob": blob_name, "processed": processed_filename, "ms": ms, "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
 
-        # Upload processed
-        upload_processed_blob(blob_service, out_path, processed_filename)
+        # Upload processed (thread)
+        await anyio.to_thread.run_sync(lambda: upload_processed_blob(blob_service, out_path, processed_filename))
 
-        # Stream back to client
         headers = {"Content-Disposition": f'attachment; filename="{processed_filename}"'}
         return StreamingResponse(stream_file_iter(out_path), media_type="text/csv", headers=headers)
     except HTTPException:
@@ -694,52 +616,46 @@ async def process_upload(
     text_column: Optional[str] = Form(None),
     provider: Optional[str] = Form(None)
 ):
-    """
-    1) Save uploaded file to 'incoming/' (if storage available), else local temp only.
-    2) Process streaming to a temp CSV (never build giant DF).
-    3) Upload enriched CSV to 'processed/' if storage is available.
-    4) Return the processed CSV as a streamed response.
-    """
     req_id = uuid.uuid4().hex[:8]
     original = file.filename or "upload.csv"
     safe_base = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(original))
     ts = time.strftime("%Y%m%d-%H%M%S")
     incoming_name = f"{ts}_{safe_base}"
 
-    # Write upload to temp file immediately
     in_fd, in_path = tempfile.mkstemp(prefix="upload_", suffix=os.path.splitext(safe_base)[1] or ".csv")
     os.close(in_fd)
     try:
         data = await file.read()
-        with open(in_path, "wb") as fh:
-            fh.write(data)
+        # minimal time on the loop
+        await anyio.to_thread.run_sync(lambda: open(in_path, "wb").write(data))
         del data; gc.collect()
 
         blob_service = get_blob_client()
 
-        # If storage available, push original into incoming/
         if blob_service is not None:
             try:
-                ensure_container(blob_service, "incoming")
-                ctype = "text/csv" if safe_base.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                in_client = blob_service.get_blob_client(container="incoming", blob=incoming_name)
-                with open(in_path, "rb") as fh:
-                    in_client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type=ctype))
+                def _upload_incoming():
+                    ensure_container(blob_service, "incoming")
+                    ctype = "text/csv" if safe_base.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    in_client = blob_service.get_blob_client(container="incoming", blob=incoming_name)
+                    with open(in_path, "rb") as fh:
+                        in_client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type=ctype))
+                await anyio.to_thread.run_sync(_upload_incoming)
                 log.info({"op": "upload-to-incoming", "blob": f"incoming/{incoming_name}", "bytes": os.path.getsize(in_path), "req_id": req_id})
             except Exception as e:
                 log.warning({"op": "blob-route-failed", "error": str(e), "req_id": req_id})
 
-        # Process streaming -> temp out
+        # Process streaming -> temp out (thread)
         t0 = time.time()
-        out_path = process_local_file_to_csv(in_path, original_name=safe_base, text_column=text_column, provider=provider)
+        out_path = await anyio.to_thread.run_sync(lambda: process_local_file_to_csv(in_path, original_name=safe_base, text_column=text_column, provider=provider))
         ms = int((time.time() - t0) * 1000)
         processed_filename = os.path.splitext(safe_base)[0] + "_enriched.csv"
         log.info({"op":"process-upload", "file": safe_base, "processed": processed_filename, "ms": ms, "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
 
-        # Upload processed (if storage available)
+        # Upload processed (thread) if storage available
         if blob_service is not None:
             try:
-                upload_processed_blob(blob_service, out_path, processed_filename)
+                await anyio.to_thread.run_sync(lambda: upload_processed_blob(blob_service, out_path, processed_filename))
             except Exception as e:
                 log.warning({"op":"processed-upload-skip", "error": str(e), "req_id": req_id})
 
