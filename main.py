@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fiquebot")
 
 # ----------------------------- App init -----------------------------
-app = FastAPI(title="Fiquebot API", version="1.2.0")
+app = FastAPI(title="Fiquebot API", version="1.3.0")
 
 # ----------------------------- CORS -----------------------------
 # Allow local dev and a placeholder for Azure Static Web Apps.
@@ -49,7 +49,6 @@ if os.path.isdir("web"):
 
     @app.get("/", include_in_schema=False)
     async def _root():
-        # trailing slash ensures index.html is served
         return RedirectResponse(url="/ui/")
 else:
     @app.get("/", include_in_schema=False)
@@ -65,15 +64,19 @@ TRN_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
 TRN_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "westeurope")
 
 AOAI_EP = (os.environ.get("AZURE_OPENAI_ENDPOINT", "") or "").rstrip("/")
-AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
+AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")  # currently using 35-turbo
 AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
+# Translation provider selection
+TRANSLATE_PROVIDER = os.environ.get("TRANSLATE_PROVIDER", "llm").lower()  # default to LLM primary
+LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "150"))
+LLM_SYS = "Return ONLY JSON Lines, one object per line. No commentary."
+
 # ----------------------------- Small utils -----------------------------
 def _soft_require(cond: bool, msg: str) -> bool:
-    """Log and return False instead of raising. Lets us degrade gracefully."""
     if not cond:
         log.warning({"op": "soft-require-failed", "msg": msg})
         return False
@@ -89,7 +92,6 @@ _NANP = {
     "british virgin islands", "us virgin islands", "guam", "northern mariana islands"
 }
 _COUNTRY_TO_DIAL = {
-    # Core/likely dataset countries
     "india": "+91", "kenya": "+254", "nepal": "+977", "bangladesh": "+880", "pakistan": "+92",
     "sri lanka": "+94", "australia": "+61", "new zealand": "+64", "united kingdom": "+44", "uk": "+44",
     "england": "+44", "ireland": "+353", "south africa": "+27", "nigeria": "+234", "ghana": "+233",
@@ -117,20 +119,16 @@ _COUNTRY_TO_DIAL = {
     "jamaica": "+1", "trinidad and tobago": "+1", "barbados": "+1", "bahamas": "+1",
     "canada": "+1", "united states": "+1", "united states of america": "+1", "usa": "+1",
 }
-
-# Prefixed list for phone-based inference (sorted by length desc to prefer longest match)
 _DIAL_PREFIXES = sorted({v.replace("+", "").replace("-", "") for v in _COUNTRY_TO_DIAL.values()},
                         key=lambda x: (-len(x), x))
 
 def _norm_country(name: str) -> str:
     s = (name or "").strip().lower()
-    # small canonicalizations
     s = s.replace("&", "and")
     s = re.sub(r"\s+", " ", s)
     return s
 
 def country_to_dial(country: str, phone: str = "") -> str:
-    """Return +<code> from country; fallback to inferring from phone if present."""
     if not country and phone:
         code = _infer_from_phone(phone)
         return f"+{code}" if code else ""
@@ -139,23 +137,19 @@ def country_to_dial(country: str, phone: str = "") -> str:
         return "+1"
     if s in _COUNTRY_TO_DIAL:
         return _COUNTRY_TO_DIAL[s]
-    # loose NANP heuristics
     if any(k in s for k in ["usa", "united states"]):
         return "+1"
-    # fallback: try phone
     if phone:
         code = _infer_from_phone(phone)
         return f"+{code}" if code else ""
     return ""
 
 def _infer_from_phone(phone: str) -> str:
-    """Pick the longest matching country calling prefix from a phone string like '+97150...' or '0091...'."""
     if not phone:
         return ""
     digits = re.sub(r"[^\d]", "", phone)
     if phone.strip().startswith("00"):
-        digits = digits[2:]  # strip IDD 00
-    # if it started with +, digits already stripped '+'
+        digits = digits[2:]
     for pref in _DIAL_PREFIXES:
         if digits.startswith(pref):
             return pref
@@ -183,16 +177,15 @@ def ensure_container(blob_service: BlobServiceClient, name: str):
         blob_service.create_container(name)
         log.info({"op": "container-created", "name": name})
     except ResourceExistsError:
-        pass  # already exists
+        pass
     except Exception as e:
         log.warning({"op": "container-create-skip", "name": name, "error": str(e)})
 
-# ----------------------------- Translation helpers (with language detection) -----------------------------
-def translate_and_detect(texts: List[str], to_lang: str = "en") -> List[dict]:
+# ----------------------------- Translator (MS) -----------------------------
+def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict]:
     """
     Returns list of dicts: {'translated': str, 'lang': 'xx', 'confidence': float}
     Uses Microsoft Translator /translate, which includes detectedLanguage.
-    If not configured or call fails, degrades to passthrough with lang='en'.
     """
     if not (TRN_EP and TRN_KEY and TRN_REGION):
         return [{"translated": t or "", "lang": "en", "confidence": 1.0} for t in texts]
@@ -204,7 +197,7 @@ def translate_and_detect(texts: List[str], to_lang: str = "en") -> List[dict]:
         "Content-Type": "application/json",
     }
     out: List[dict] = []
-    for i in range(0, len(texts), 50):  # batch
+    for i in range(0, len(texts), 50):
         batch = texts[i : i + 50]
         payload = [{"Text": t or ""} for t in batch]
         try:
@@ -219,15 +212,123 @@ def translate_and_detect(texts: List[str], to_lang: str = "en") -> List[dict]:
                 conf = float(det.get("score", det.get("confidence", 0)) or 0)
                 out.append({"translated": t_en, "lang": lang, "confidence": conf})
         except Exception as e:
-            log.warning({"op": "translate-fallback", "error": str(e)})
-            out.extend([{"translated": t or "", "lang": "en", "confidence": 1.0} for t in batch])
+            log.warning({"op": "translate-fallback-ms-batch", "error": str(e)})
+            out.extend([{"translated": t or "", "lang": "en", "confidence": 0.0} for t in batch])
     return out
 
-def translate_texts(texts: List[str], to_lang: str = "en") -> List[str]:
-    res = translate_and_detect(texts, to_lang=to_lang)
+# ----------------------------- LLM translation (Azure OpenAI) -----------------------------
+def _llm_translate_batch(texts: List[str], to_lang: str) -> List[dict]:
+    """
+    One LLM call for a batch. Returns [{'translated': str, 'lang': 'xx', 'confidence': float}, ...]
+    Uses JSONL to keep parsing robust. Aligns strictly to input order.
+    """
+    if not (AOAI_EP and AOAI_KEY and AOAI_DEP):
+        # No LLM configured -> empty signal so caller can fallback
+        raise RuntimeError("LLM not configured")
+
+    rows = [{"id": i, "text": (t or "")} for i, t in enumerate(texts)]
+    lines = [f'- id="{r["id"]}" text="{r["text"].replace("\\", "\\\\").replace("\"","\\\"")}"' for r in rows]
+
+    user_prompt = f"""
+You are a professional translator and language detector.
+Translate each row's 'text' into {to_lang}.
+For each input row, output exactly one JSON object on its own line with keys: id (int), translated (str), lang (e.g., "en","hi","es"), confidence (0..1).
+Do not add extra keys. Do not add commentary. Preserve numbers and punctuation.
+
+Rows:
+{chr(10).join(lines)}
+
+Example JSONL (format only):
+{{"id": 0, "translated": "…", "lang": "en", "confidence": 0.99}}
+"""
+
+    url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
+    headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
+    body = {
+        "messages": [
+            {"role": "system", "content": LLM_SYS},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 3000,
+    }
+
+    # backoff retries
+    for attempt in range(5):
+        try:
+            with httpx.Client(timeout=120) as h:
+                r = h.post(url, headers=headers, json=body)
+                r.raise_for_status()
+                j = r.json()
+            content = (j["choices"][0]["message"]["content"] or "").strip()
+            out_map = {}
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    out_map[int(obj.get("id"))] = {
+                        "translated": str(obj.get("translated", "")),
+                        "lang": (obj.get("lang") or "").lower(),
+                        "confidence": float(obj.get("confidence", 0.0) or 0.0),
+                    }
+                except Exception:
+                    continue
+            aligned = []
+            for i in range(len(texts)):
+                aligned.append(out_map.get(i, {"translated": texts[i] or "", "lang": "en", "confidence": 0.0}))
+            return aligned
+        except Exception as e:
+            wait = min(2 ** attempt, 20)
+            log.warning({"op": "llm-translate-retry", "attempt": attempt + 1, "wait": wait, "error": str(e)})
+            time.sleep(wait)
+
+    # Bubble up to let caller fallback to MS
+    raise RuntimeError("LLM translation failed after retries")
+
+def translate_and_detect_llm(texts: List[str], to_lang: str = "en") -> List[dict]:
+    out: List[dict] = []
+    for i in range(0, len(texts), LLM_MAX_BATCH):
+        batch = texts[i:i + LLM_MAX_BATCH]
+        res = _llm_translate_batch(batch, to_lang)
+        out.extend(res)
+    return out
+
+# ----------------------------- Unified translation (LLM primary, MS fallback) -----------------------------
+def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Optional[str] = None) -> List[dict]:
+    """
+    provider: "llm" | "ms" | None (falls back to env TRANSLATE_PROVIDER).
+    Behavior:
+      - "llm": try LLM; on failure, fallback to MS (if configured), else passthrough.
+      - "ms": use Microsoft Translator (existing behavior); on failure, passthrough.
+      - None: use TRANSLATE_PROVIDER env ("llm" default here).
+    """
+    prov = (provider or TRANSLATE_PROVIDER or "llm").lower()
+
+    if prov == "ms":
+        try:
+            return _translate_and_detect_ms(texts, to_lang=to_lang)
+        except Exception as e:
+            log.warning({"op": "ms-translate-hardfail", "error": str(e)})
+            return [{"translated": t or "", "lang": "en", "confidence": 0.0} for t in texts]
+
+    # prov == "llm" (primary) with fallback to MS
+    try:
+        return translate_and_detect_llm(texts, to_lang=to_lang)
+    except Exception as e:
+        log.warning({"op": "llm-primary-fallback-ms", "error": str(e)})
+        try:
+            return _translate_and_detect_ms(texts, to_lang=to_lang)
+        except Exception as e2:
+            log.warning({"op": "ms-fallback-failed", "error": str(e2)})
+            return [{"translated": t or "", "lang": "en", "confidence": 0.0} for t in texts]
+
+def translate_texts(texts: List[str], to_lang: str = "en", provider: Optional[str] = None) -> List[str]:
+    res = translate_and_detect(texts, to_lang=to_lang, provider=provider)
     return [r["translated"] for r in res]
 
-# ----------------------------- Entity extraction -----------------------------
+# ----------------------------- Entity extraction (Azure OpenAI) -----------------------------
 def extract_entities(text: str) -> dict:
     """Degrade gracefully to empty entities if OpenAI isn't configured or call fails."""
     if not (AOAI_EP and AOAI_KEY and AOAI_DEP):
@@ -235,16 +336,15 @@ def extract_entities(text: str) -> dict:
 
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
     headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
-    # Clean text to avoid control chars confusing LLM
     cleaned = "".join(c for c in text if c.isprintable() or c.isspace())
     prompt = f"""
-    Extract entities from the following text and return them as JSON with fields:
-    country, phone, book, language_mentioned, address.
-    Book must be either "Gyan Ganga", "Way of Living", or empty string "".
-    Use empty string "" for any field not found.
-    Text: {cleaned}
-    Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}}
-    """
+Extract entities from the following text and return them as JSON with fields:
+country, phone, book, language_mentioned, address.
+Book must be either "Gyan Ganga", "Way of Living", or empty string "".
+Use empty string "" for any field not found.
+Text: {cleaned}
+Return format: {{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""}}
+"""
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 200, "temperature": 0.3}
     try:
         with httpx.Client(timeout=60) as h:
@@ -257,15 +357,13 @@ def extract_entities(text: str) -> dict:
         return {"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}
 
 # ----------------------------- IO helpers -----------------------------
-
 def _try_read_csv(content: bytes) -> Optional[pd.DataFrame]:
-    """Robust CSV reader with multiple fallbacks."""
     for enc in ["utf-8-sig", "utf-8", "latin1"]:
         try:
             df = pd.read_csv(
                 io.BytesIO(content),
-                sep=None,  # let pandas sniff delimiter
-                engine="python",  # sniff + tolerate bad lines
+                sep=None,
+                engine="python",
                 dtype=str,
                 encoding=enc,
                 on_bad_lines="skip",
@@ -276,93 +374,71 @@ def _try_read_csv(content: bytes) -> Optional[pd.DataFrame]:
     log.debug({"op": "csv-read-failed", "last_error": last})
     return None
 
-
 def _try_read_excel(content: bytes, ext: str) -> Optional[pd.DataFrame]:
-    """Try Excel via openpyxl (xlsx/xlsm) or xlrd (xls) with fallbacks."""
     try:
         if ext in (".xlsx", ".xlsm"):
             return pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype=str)
         if ext == ".xls":
             return pd.read_excel(io.BytesIO(content), engine="xlrd", dtype=str)
-        # unknown excel-like -> try openpyxl
         return pd.read_excel(io.BytesIO(content), engine="openpyxl", dtype=str)
     except Exception as e:
         log.debug({"op": "excel-read-failed", "error": str(e)})
         return None
 
-
 def _read_dataframe_from_bytes(name: str, content: bytes) -> pd.DataFrame:
-    """Best-effort reader that never raises: returns at least an empty DF."""
     name_lower = (name or "").lower()
     ext = ".csv" if name_lower.endswith(".csv") else os.path.splitext(name_lower)[1]
 
     df: Optional[pd.DataFrame] = None
-    # Prefer CSV if extension says so
     if ext == ".csv":
         df = _try_read_csv(content)
         if df is None:
-            # maybe it's actually excel; try anyway
             df = _try_read_excel(content, ".xlsx")
     else:
-        # Try Excel-style first
         df = _try_read_excel(content, ext)
         if df is None:
-            # fall back to CSV sniff
             df = _try_read_csv(content)
 
     if df is None:
         log.warning({"op": "read-fallback-empty", "name": name})
-        return pd.DataFrame(columns=["text"])  # minimal frame
+        return pd.DataFrame(columns=["text"])
 
-    # Normalize columns to strings
     df.columns = [str(c) if c is not None else "" for c in df.columns]
-    # Coerce all cells to strings where possible
     try:
         df = df.applymap(lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else str(x)))
     except Exception:
         pass
 
-    # If no columns, create one
     if len(df.columns) == 0:
         df["text"] = ""
 
     return df
 
 # ----------------------------- Core processing -----------------------------
-
 def _choose_text_column(df: pd.DataFrame, requested: Optional[str]) -> str:
     if requested and requested in df.columns:
         return requested
-    # common text-like names
     candidates = [c for c in df.columns if str(c).strip().lower() in {"text", "message", "content", "description", "body"}]
     if candidates:
         return candidates[0]
-    # else: if there's only one column, use it; otherwise synthesize a 'text' column joining string columns
     if len(df.columns) == 1:
         return df.columns[0]
-    # Synthesize a text column
     df["__synthetic_text__"] = df.astype(str).apply(lambda r: " ".join([v for v in r.values if v and v != "nan"]), axis=1)
     return "__synthetic_text__"
 
-
-def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Optional[str] = None, req_id: Optional[str] = None) -> Tuple[bytes, str]:
+def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Optional[str] = None, req_id: Optional[str] = None, provider: Optional[str] = None) -> Tuple[bytes, str]:
     """
     Process a file already in-memory and return (csv_bytes, suggested_name).
-    This is used both for uploads and as a fallback when blob storage is unavailable.
     """
     df = _read_dataframe_from_bytes(name, content)
-
-    # Choose text column (with synthesis if needed)
     col = _choose_text_column(df, text_column)
 
-    # Robust mask (non-null & non-empty after strip)
     series = df[col].astype(str)
     mask = series.notna() & (series.astype(str).str.strip() != "")
     valid_indices = series[mask].index.tolist()
     valid_texts = series[mask].astype(str).tolist()
     log.info({"op": "filtered-texts", "count": len(valid_texts), "column": col, "req_id": req_id})
 
-    # Allocate full-size columns for language/translation QA
     n = len(df)
     source_lang_full: List[str] = [""] * n
     trans_conf_full: List[float] = [0.0] * n
@@ -373,9 +449,8 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
     full_rows = [{"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""} for _ in range(n)]
 
     if valid_texts:
-        # translate with detection (degrades to passthrough if not configured)
-        trans_results = translate_and_detect(valid_texts, to_lang="en")
-        valid_row_indices = []
+        # LLM primary with MS fallback handled inside translate_and_detect
+        trans_results = translate_and_detect(valid_texts, to_lang="en", provider=provider)
         for i, res in enumerate(trans_results):
             t_en = res.get("translated", "")
             lang = (res.get("lang", "") or "").lower()
@@ -397,7 +472,7 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
             except Exception as e:
                 log.warning({"op": "extract-catch", "error": str(e), "req_id": req_id})
                 entities = {"country": "", "phone": "", "book": "", "language_mentioned": "", "address": ""}
-            # Place entity row regardless of emptiness (stable schema)
+
             full_rows[src_idx] = {
                 "country": entities.get("country", ""),
                 "phone": entities.get("phone", ""),
@@ -405,11 +480,8 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
                 "language_mentioned": entities.get("language_mentioned", ""),
                 "address": entities.get("address", ""),
             }
-            valid_row_indices.append(src_idx)
 
-    # Build output DataFrame
     edf = df.copy()
-    # If we synthesized a text col, keep original columns and add translated_en; don't leak synthetic name
     edf["translated_en"] = translated_full
     edf["source_lang"] = source_lang_full
     edf["translation_confidence"] = trans_conf_full
@@ -418,7 +490,6 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
 
     ents_df = pd.DataFrame(full_rows, index=df.index)
 
-    # Add dialing_code based on the extracted country (fallback from phone if possible)
     dialing_codes: List[str] = []
     for idx in ents_df.index:
         ctry = str(ents_df.at[idx, "country"] or "")
@@ -428,31 +499,24 @@ def process_excel_blob_from_bytes(name: str, content: bytes, text_column: Option
 
     out_df = pd.concat([edf, ents_df], axis=1)
 
-    # Serialize CSV
     out = io.StringIO()
     out_df.to_csv(out, index=False, encoding="utf-8")
     out_bytes = out.getvalue().encode("utf-8")
 
-    # suggest processed file name
     base = os.path.basename(name or "upload.csv")
     processed_filename = base.rsplit(".", 1)[0] + "_enriched.csv"
     return out_bytes, processed_filename
 
-
-def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id: Optional[str] = None) -> Tuple[bytes, str]:
+def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id: Optional[str] = None, provider: Optional[str] = None) -> Tuple[bytes, str]:
     """
     Reads from incoming/<file>, writes enriched CSV to processed/<file>_enriched.csv if storage is available.
-    If storage is unavailable, processes entirely in-memory and returns bytes without attempting to upload.
-    Always returns CSV bytes and a path-like name; never raises 500 for data issues.
     """
     log.info({"op": "process-excel-start", "blob": blob_name, "req_id": req_id})
 
     blob_service = get_blob_client()
     if blob_service is None:
-        # Storage not available: try to interpret blob_name as local path (dev) or fail soft
         log.warning({"op": "storage-missing-fallback", "blob": blob_name})
-        # Soft fail: return minimal CSV
-        return process_excel_blob_from_bytes(os.path.basename(blob_name), b"", text_column, req_id)
+        return process_excel_blob_from_bytes(os.path.basename(blob_name), b"", text_column, req_id=req_id, provider=provider)
 
     try:
         ensure_container(blob_service, "incoming")
@@ -467,12 +531,10 @@ def process_excel_blob(blob_name: str, text_column: Optional[str] = None, req_id
         log.info({"op": "blob-download-complete", "blob": blob_name, "bytes": len(content), "req_id": req_id})
     except Exception as e:
         log.warning({"op": "blob-download-failed", "blob": blob_name, "error": str(e), "req_id": req_id})
-        # Soft fallback: empty content
         content = b""
 
-    out_bytes, processed_filename = process_excel_blob_from_bytes(blob_name, content, text_column, req_id=req_id)
+    out_bytes, processed_filename = process_excel_blob_from_bytes(blob_name, content, text_column, req_id=req_id, provider=provider)
 
-    # Try to upload to processed/ if we can
     try:
         out_client = blob_service.get_blob_client(container="processed", blob=processed_filename)
         out_client.upload_blob(
@@ -500,6 +562,9 @@ async def debug_env():
         "AZURE_TRANSLATOR_REGION": os.environ.get("AZURE_TRANSLATOR_REGION"),
         "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT"),
         "AZURE_OPENAI_API_KEY": "REDACTED" if os.environ.get("AZURE_OPENAI_API_KEY") else "MISSING",
+        "AZURE_OPENAI_DEPLOYMENT": AOAI_DEP,
+        "TRANSLATE_PROVIDER": TRANSLATE_PROVIDER,
+        "LLM_MAX_BATCH": LLM_MAX_BATCH,
         "STORAGE_ACCOUNT_NAME": os.environ.get("STORAGE_ACCOUNT_NAME"),
         "AZURE_STORAGE_CONNECTION_STRING": "REDACTED" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING") else "MISSING",
         "CORS_ALLOW_ORIGINS": allow_origins,
@@ -508,43 +573,42 @@ async def debug_env():
 @app.post("/translate")
 async def translate_api(payload: dict):
     """
-    payload: { 'texts': ['...', '...'], 'to': 'en' }
-    - keeps the old response shape for compatibility
-    - degrades to passthrough if translator not configured
+    payload: { 'texts': ['...', '...'], 'to': 'en', 'provider': 'llm'|'ms' }
+    - LLM primary (default via env), MS fallback when LLM fails
     """
     req_id = uuid.uuid4().hex[:8]
     texts = payload.get("texts") or []
     to = payload.get("to", "en")
+    provider = (payload.get("provider") or "").lower() or None
     if not isinstance(texts, list) or len(texts) == 0:
         raise HTTPException(400, "Provide texts: []")
     t0 = time.time()
-    out = translate_texts([str(x) for x in texts], to_lang=to)
-    log.info({"op": "translate", "n": len(texts), "ms": int((time.time() - t0) * 1000), "req_id": req_id})
+    out = translate_texts([str(x) for x in texts], to_lang=to, provider=provider)
+    log.info({"op": "translate", "n": len(texts), "ms": int((time.time() - t0) * 1000), "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
     return {"translations": out}
 
 @app.post("/process-xlsx")
-async def process_xlsx(blob_name: str, text_column: Optional[str] = None):
+async def process_xlsx(blob_name: str, text_column: Optional[str] = None, provider: Optional[str] = None):
     """
     Process a file that ALREADY exists in 'incoming/' and return the enriched CSV.
-    - blob_name must start with 'incoming/' and end with .xlsx/.xlsm/.xls/.csv
-    - never returns 500 for data/format issues; always returns a CSV (may be minimal) on soft failures
+    Accepts optional provider override: 'llm' or 'ms'.
     """
     req_id = uuid.uuid4().hex[:8]
     if not blob_name.lower().endswith((".xlsx", ".xlsm", ".xls", ".csv")) or not blob_name.startswith("incoming/"):
         raise HTTPException(400, "Provide valid blob_name (e.g., 'incoming/sample.xlsx' or 'incoming/sample.csv')")
     try:
         t0 = time.time()
-        content, processed_blob_name = process_excel_blob(blob_name, text_column, req_id=req_id)
+        content, processed_blob_name = process_excel_blob(blob_name, text_column, req_id=req_id, provider=provider)
         log.info(
             {
                 "op": "process-xlsx",
                 "blob": blob_name,
                 "processed": processed_blob_name,
                 "ms": int((time.time() - t0) * 1000),
+                "provider": provider or TRANSLATE_PROVIDER,
                 "req_id": req_id,
             }
         )
-        # processed_blob_name may be 'processed/<name>' or just a name; normalize filename for download header
         fname = os.path.basename(processed_blob_name)
         return StreamingResponse(
             io.BytesIO(content),
@@ -554,22 +618,21 @@ async def process_xlsx(blob_name: str, text_column: Optional[str] = None):
     except HTTPException:
         raise
     except Exception as e:
-        # Last-resort soft fail: return a minimal CSV with an error column
         log.exception({"op": "process-failed-soft", "blob": blob_name, "error": str(e), "req_id": req_id})
         out = io.StringIO()
         pd.DataFrame([{"error": str(e)}]).to_csv(out, index=False)
         return StreamingResponse(io.BytesIO(out.getvalue().encode("utf-8")), media_type="text/csv")
 
 @app.post("/process-upload")
-async def process_upload(file: UploadFile = File(...), text_column: Optional[str] = Form(None)):
+async def process_upload(file: UploadFile = File(...), text_column: Optional[str] = Form(None), provider: Optional[str] = Form(None)):
     """
     1) If Azure Blob Storage is available, save uploaded file to 'incoming/' then process and also upload to 'processed/'.
     2) If storage is unavailable, process entirely in-memory.
     3) Always return the processed CSV (never 500 for data/format issues).
+    Optional 'provider' form field can be 'llm' or 'ms'.
     """
     req_id = uuid.uuid4().hex[:8]
     try:
-        # sanitize filename
         original = file.filename or "upload.csv"
         base = os.path.basename(original)
         safe_base = re.sub(r"[^A-Za-z0-9_.-]", "_", base)
@@ -584,7 +647,6 @@ async def process_upload(file: UploadFile = File(...), text_column: Optional[str
                 ensure_container(blob_service, "incoming")
                 ensure_container(blob_service, "processed")
 
-                # content type for raw upload
                 ctype = "text/csv" if incoming_name.lower().endswith(".csv") else \
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -592,8 +654,7 @@ async def process_upload(file: UploadFile = File(...), text_column: Optional[str
                 in_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type=ctype))
                 log.info({"op": "upload-to-incoming", "blob": f"incoming/{incoming_name}", "bytes": len(data), "req_id": req_id})
 
-                # process from incoming/ -> writes to processed/ and returns bytes
-                content, processed_blob_name = process_excel_blob(f"incoming/{incoming_name}", text_column, req_id=req_id)
+                content, processed_blob_name = process_excel_blob(f"incoming/{incoming_name}", text_column, req_id=req_id, provider=provider)
                 fname = os.path.basename(processed_blob_name)
 
                 return StreamingResponse(
@@ -605,8 +666,7 @@ async def process_upload(file: UploadFile = File(...), text_column: Optional[str
                 log.warning({"op": "blob-route-failed", "error": str(e), "req_id": req_id})
                 # fall through to in-memory processing
 
-        # In-memory processing path
-        content, processed_name = process_excel_blob_from_bytes(incoming_name, data, text_column, req_id=req_id)
+        content, processed_name = process_excel_blob_from_bytes(incoming_name, data, text_column, req_id=req_id, provider=provider)
         return StreamingResponse(
             io.BytesIO(content),
             media_type="text/csv",
