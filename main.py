@@ -1,6 +1,7 @@
-import os, io, time, json, logging, re, uuid, csv, tempfile, gc
+import os, io, time, json, logging, re, uuid, csv, tempfile, gc, asyncio
 from typing import List, Tuple, Optional, Iterable, Dict, Any
-from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
 
 import httpx
 import pandas as pd
@@ -20,61 +21,83 @@ from openpyxl import load_workbook
 import anyio
 
 # ============================= In-memory log buffer =============================
-LOG_CAPACITY = int(os.environ.get("LOG_BUFFER_CAPACITY", "1000"))
-_LOG_DEQUE = deque(maxlen=LOG_CAPACITY)
+class RingLogHandler(logging.Handler):
+    def __init__(self, capacity: int = 2000):
+        super().__init__()
+        self.capacity = max(100, int(capacity))
+        self.buf: List[Dict[str, Any]] = []
+        self._lock = asyncio.Lock()
 
-class UiLogHandler(logging.Handler):
-    def emit(self, record: logging.LogRecord) -> None:
+    def format_record(self, record: logging.LogRecord) -> Dict[str, Any]:
         try:
-            msg = self.format(record)
+            msg = record.getMessage()
         except Exception:
+            msg = record.msg
+        # Try to parse dict-like messages for nicer display
+        parsed = None
+        if isinstance(record.args, dict):
+            parsed = record.args
+        else:
             try:
-                msg = record.getMessage()
+                parsed = json.loads(msg) if isinstance(msg, str) and msg.startswith("{") else None
             except Exception:
-                msg = str(record)
-        _LOG_DEQUE.append(msg)
+                parsed = None
+        return {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": msg if parsed is None else parsed,
+        }
 
-def _init_logging():
-    # Base formatter with ISO-ish timestamps
-    fmt = logging.Formatter(
-        fmt="%(asctime)sZ %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S"
-    )
-    ui_handler = UiLogHandler()
-    ui_handler.setLevel(logging.INFO)
-    ui_handler.setFormatter(fmt)
+    async def aemit(self, record: logging.LogRecord):
+        item = self.format_record(record)
+        async with self._lock:
+            self.buf.append(item)
+            if len(self.buf) > self.capacity:
+                self.buf = self.buf[-self.capacity:]
 
-    # Root logger
-    root = logging.getLogger()
-    # If uvicorn configured basic handlers, avoid duplicate lines
-    if not any(isinstance(h, UiLogHandler) for h in root.handlers):
-        root.addHandler(ui_handler)
-    root.setLevel(logging.INFO)
+    def emit(self, record: logging.LogRecord):
+        # schedule without blocking the loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.aemit(record))
+            else:
+                # fallback (tests)
+                item = self.format_record(record)
+                self.buf.append(item)
+                if len(self.buf) > self.capacity:
+                    self.buf = self.buf[-self.capacity:]
+        except RuntimeError:
+            item = self.format_record(record)
+            self.buf.append(item)
+            if len(self.buf) > self.capacity:
+                self.buf = self.buf[-self.capacity:]
 
-    # Make sure our app logger exists too
-    app_logger = logging.getLogger("fiquebot")
-    app_logger.setLevel(logging.INFO)
-    if not any(isinstance(h, UiLogHandler) for h in app_logger.handlers):
-        app_logger.addHandler(ui_handler)
 
-_init_logging()
+ring_handler = RingLogHandler(capacity=3000)
+logging.basicConfig(level=logging.INFO, handlers=[ring_handler])
 log = logging.getLogger("fiquebot")
-log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", LOG_CAPACITY)
+log.setLevel(logging.INFO)
+if ring_handler not in log.handlers:
+    log.addHandler(ring_handler)
+log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", ring_handler.capacity)
 
-# ============================= App init =============================
-app = FastAPI(title="Fiquebot API", version="2.0.2")
+# ============================= App init & CORS =============================
+app = FastAPI(title="Fiquebot API", version="2.1.0")
 
-# ============================= CORS =============================
 _default_origins = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
     "https://<YOUR-STATIC-WEB-APP>.azurestaticapps.net",
-    # add your actual SWA hostname if different
+    # add your SWA hostname explicitly if needed
+    "https://orange-dune-0ea42a603.1.azurestaticapps.net",
 ]
 _env_origins = os.environ.get("FRONTEND_ORIGINS") or os.environ.get("ALLOWED_ORIGINS")
 allow_origins = [o.strip() for o in _env_origins.split(",") if o.strip()] if _env_origins else _default_origins
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -83,7 +106,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================= Serve /ui =============================
+# Serve /ui (optional)
 if os.path.isdir("web"):
     app.mount("/ui", StaticFiles(directory="web", html=True), name="ui")
 
@@ -111,7 +134,7 @@ AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
 TRANSLATE_PROVIDER = os.environ.get("TRANSLATE_PROVIDER", "llm").lower()  # "llm" | "ms"
-LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "80"))  # slightly smaller to reduce peak memory
+LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "80"))  # balance speed/peak memory
 LLM_SYS = "Return ONLY JSON Lines, one object per line. No commentary."
 ENTITY_CONF_THRESHOLD = float(os.environ.get("ENTITY_CONF_THRESHOLD", "0.60"))
 CSV_CHUNK = int(os.environ.get("CSV_CHUNK", "10000"))
@@ -126,7 +149,7 @@ def _soft_require(cond: bool, msg: str) -> bool:
 def is_truthy(s: Optional[str]) -> bool:
     return str(s or "").strip().lower() in {"1", "true", "yes", "y"}
 
-# ============================= Dialing codes =============================
+# ============================= Dialing codes (condensed) =============================
 _NANP = {
     "united states", "united states of america", "usa", "canada",
     "bahamas", "barbados", "bermuda", "jamaica", "dominican republic", "haiti",
@@ -560,29 +583,91 @@ def upload_processed_blob(blob_service: BlobServiceClient, processed_path: str, 
         client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type="text/csv"))
     log.info({"op":"blob-upload", "blob": f"processed/{processed_filename}", "bytes": os.path.getsize(processed_path)})
 
+# ============================= Async Job model =============================
+class JobState(str, Enum):
+    queued = "queued"
+    running = "running"
+    done = "done"
+    error = "error"
+
+@dataclass
+class Job:
+    id: str
+    filename: str
+    text_column: Optional[str]
+    provider: Optional[str]
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    state: JobState = JobState.queued
+    error: Optional[str] = None
+    incoming_blob: Optional[str] = None
+    processed_filename: Optional[str] = None
+    processed_path: Optional[str] = None
+
+JOBS: Dict[str, Job] = {}
+
+async def _run_upload_job(job: Job, data: bytes):
+    job.state = JobState.running
+    req_id = uuid.uuid4().hex[:8]
+    in_path = None
+    try:
+        safe_base = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(job.filename or "upload.csv"))
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        incoming_name = f"{ts}_{safe_base}"
+
+        in_fd, in_path = tempfile.mkstemp(prefix="upload_", suffix=os.path.splitext(safe_base)[1] or ".csv")
+        os.close(in_fd)
+        await anyio.to_thread.run_sync(lambda: open(in_path, "wb").write(data))
+
+        blob_service = get_blob_client()
+        if blob_service is not None:
+            try:
+                def _upload_incoming():
+                    ensure_container(blob_service, "incoming")
+                    ctype = "text/csv" if safe_base.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    in_client = blob_service.get_blob_client(container="incoming", blob=incoming_name)
+                    with open(in_path, "rb") as fh:
+                        in_client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type=ctype))
+                await anyio.to_thread.run_sync(_upload_incoming)
+                log.info({"op":"upload-to-incoming", "blob": f"incoming/{incoming_name}", "bytes": os.path.getsize(in_path), "req_id": req_id})
+                job.incoming_blob = f"incoming/{incoming_name}"
+            except Exception as e:
+                log.warning({"op":"blob-route-failed", "error": str(e), "req_id": req_id})
+
+        t0 = time.time()
+        out_path = await anyio.to_thread.run_sync(
+            lambda: process_local_file_to_csv(in_path, original_name=safe_base, text_column=job.text_column, provider=job.provider)
+        )
+        ms = int((time.time() - t0) * 1000)
+        processed_filename = os.path.splitext(safe_base)[0] + "_enriched.csv"
+        log.info({"op":"process-upload", "file": safe_base, "processed": processed_filename, "ms": ms, "provider": job.provider or TRANSLATE_PROVIDER, "req_id": req_id})
+
+        if blob_service is not None:
+            try:
+                await anyio.to_thread.run_sync(lambda: upload_processed_blob(blob_service, out_path, processed_filename))
+            except Exception as e:
+                log.warning({"op":"processed-upload-skip", "error": str(e), "req_id": req_id})
+
+        job.processed_filename = processed_filename
+        job.processed_path = out_path
+        job.state = JobState.done
+        job.finished_at = time.time()
+    except Exception as e:
+        log.exception({"op":"async-job-failed", "error": str(e)})
+        job.error = str(e)
+        job.state = JobState.error
+        job.finished_at = time.time()
+    finally:
+        try:
+            if in_path and os.path.exists(in_path):
+                os.remove(in_path)
+        except Exception:
+            pass
+
 # ============================= Endpoints =============================
 @app.get("/health")
 async def health_check():
-    # Plain text makes it easy for quick checks; still JSON is fine if you prefer.
-    return PlainTextResponse("ok")
-
-@app.get("/logs")
-async def get_logs(limit: int = 500):
-    """
-    Return recent server logs for the UI. The buffer is process-local and capped.
-    Query: ?limit=500 (default)
-    """
-    try:
-        limit = max(1, min(limit, LOG_CAPACITY))
-    except Exception:
-        limit = 500
-    lines = list(_LOG_DEQUE)[-limit:]
-    # Disable caches
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-    return JSONResponse({"logs": lines, "count": len(lines), "capacity": LOG_CAPACITY}, headers=headers)
+    return {"status": "healthy"}
 
 @app.get("/debug-env")
 async def debug_env():
@@ -599,8 +684,14 @@ async def debug_env():
         "STORAGE_ACCOUNT_NAME": os.environ.get("STORAGE_ACCOUNT_NAME"),
         "AZURE_STORAGE_CONNECTION_STRING": "REDACTED" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING") else "MISSING",
         "CORS_ALLOW_ORIGINS": allow_origins,
-        "LOG_BUFFER_CAPACITY": LOG_CAPACITY,
     }
+
+@app.get("/logs")
+async def logs_api(limit: int = Query(500, ge=1, le=2000)):
+    # Return the last N log lines (already structured)
+    # No auth because these are application-level info logs you already expose in UI
+    buf = ring_handler.buf[-limit:]
+    return {"items": buf, "count": len(buf)}
 
 @app.post("/translate")
 async def translate_api(payload: dict):
@@ -611,11 +702,11 @@ async def translate_api(payload: dict):
     if not isinstance(texts, list) or len(texts) == 0:
         raise HTTPException(400, "Provide texts: []")
     t0 = time.time()
-    # do the heavy work off the event loop
     out = await anyio.to_thread.run_sync(lambda: translate_and_detect([str(x) for x in texts], to_lang=to, provider=provider))
     log.info({"op": "translate", "n": len(texts), "ms": int((time.time() - t0) * 1000), "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
     return {"rows": out}
 
+# ---------- Synchronous (kept for compatibility; can timeout for big files) ----------
 @app.post("/process-xlsx")
 async def process_xlsx(
     blob_name: str = Query(..., description="e.g., 'incoming/sample.xlsx' or 'incoming/sample.csv'"),
@@ -636,7 +727,6 @@ async def process_xlsx(
     in_tmp_fd, in_tmp_path = tempfile.mkstemp(prefix="incoming_", suffix=os.path.splitext(blob_name)[1])
     os.close(in_tmp_fd)
     try:
-        # Download in a worker thread to avoid blocking the loop
         def _download():
             in_client = blob_service.get_blob_client(container="incoming", blob=blob_name.replace("incoming/", ""))
             log.info({"op": "blob-download-start", "blob": blob_name, "req_id": req_id})
@@ -647,14 +737,12 @@ async def process_xlsx(
 
         await anyio.to_thread.run_sync(_download)
 
-        # Process file -> temp CSV (thread)
         t0 = time.time()
         out_path = await anyio.to_thread.run_sync(lambda: process_local_file_to_csv(in_tmp_path, original_name=blob_name, text_column=text_column, provider=provider))
         ms = int((time.time() - t0) * 1000)
         processed_filename = os.path.basename(blob_name).rsplit(".", 1)[0] + "_enriched.csv"
         log.info({"op": "process-xlsx", "blob": blob_name, "processed": processed_filename, "ms": ms, "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
 
-        # Upload processed (thread)
         await anyio.to_thread.run_sync(lambda: upload_processed_blob(blob_service, out_path, processed_filename))
 
         headers = {"Content-Disposition": f'attachment; filename="{processed_filename}"'}
@@ -686,7 +774,6 @@ async def process_upload(
     os.close(in_fd)
     try:
         data = await file.read()
-        # minimal time on the loop
         await anyio.to_thread.run_sync(lambda: open(in_path, "wb").write(data))
         del data; gc.collect()
 
@@ -705,14 +792,12 @@ async def process_upload(
             except Exception as e:
                 log.warning({"op": "blob-route-failed", "error": str(e), "req_id": req_id})
 
-        # Process streaming -> temp out (thread)
         t0 = time.time()
         out_path = await anyio.to_thread.run_sync(lambda: process_local_file_to_csv(in_path, original_name=safe_base, text_column=text_column, provider=provider))
         ms = int((time.time() - t0) * 1000)
         processed_filename = os.path.splitext(safe_base)[0] + "_enriched.csv"
         log.info({"op":"process-upload", "file": safe_base, "processed": processed_filename, "ms": ms, "provider": provider or TRANSLATE_PROVIDER, "req_id": req_id})
 
-        # Upload processed (thread) if storage available
         if blob_service is not None:
             try:
                 await anyio.to_thread.run_sync(lambda: upload_processed_blob(blob_service, out_path, processed_filename))
@@ -730,3 +815,43 @@ async def process_upload(
     finally:
         try: os.remove(in_path)
         except Exception: pass
+
+# ---------- Async (recommended) – avoids front-door timeout ----------
+@app.post("/process-upload-async")
+async def process_upload_async(
+    file: UploadFile = File(...),
+    text_column: Optional[str] = Form(None),
+    provider: Optional[str] = Form(None)
+):
+    data = await file.read()
+    job_id = uuid.uuid4().hex
+    job = Job(id=job_id, filename=file.filename or "upload.csv", text_column=text_column, provider=provider)
+    JOBS[job_id] = job
+    asyncio.create_task(_run_upload_job(job, data))
+    return {"job_id": job_id, "state": job.state}
+
+@app.get("/jobs/{job_id}")
+async def job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return {
+        "job_id": job.id,
+        "state": job.state,
+        "filename": job.filename,
+        "incoming_blob": job.incoming_blob,
+        "processed_filename": job.processed_filename,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "error": job.error,
+    }
+
+@app.get("/jobs/{job_id}/download")
+async def job_download(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.state != JobState.done or not job.processed_path:
+        raise HTTPException(409, "not ready")
+    headers = {"Content-Disposition": f'attachment; filename="{job.processed_filename or "output.csv"}"'}
+    return StreamingResponse(stream_file_iter(job.processed_path), media_type="text/csv", headers=headers)
