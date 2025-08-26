@@ -1,5 +1,6 @@
 import os, io, time, json, logging, re, uuid, csv, tempfile, gc
 from typing import List, Tuple, Optional, Iterable, Dict, Any
+from collections import deque
 
 import httpx
 import pandas as pd
@@ -18,20 +19,59 @@ from openpyxl import load_workbook
 # offload heavy sync steps to a thread so the event loop stays alive
 import anyio
 
-# ----------------------------- Logging -----------------------------
-logging.basicConfig(level=logging.INFO)
+# ============================= In-memory log buffer =============================
+LOG_CAPACITY = int(os.environ.get("LOG_BUFFER_CAPACITY", "1000"))
+_LOG_DEQUE = deque(maxlen=LOG_CAPACITY)
+
+class UiLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(record)
+        _LOG_DEQUE.append(msg)
+
+def _init_logging():
+    # Base formatter with ISO-ish timestamps
+    fmt = logging.Formatter(
+        fmt="%(asctime)sZ %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S"
+    )
+    ui_handler = UiLogHandler()
+    ui_handler.setLevel(logging.INFO)
+    ui_handler.setFormatter(fmt)
+
+    # Root logger
+    root = logging.getLogger()
+    # If uvicorn configured basic handlers, avoid duplicate lines
+    if not any(isinstance(h, UiLogHandler) for h in root.handlers):
+        root.addHandler(ui_handler)
+    root.setLevel(logging.INFO)
+
+    # Make sure our app logger exists too
+    app_logger = logging.getLogger("fiquebot")
+    app_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, UiLogHandler) for h in app_logger.handlers):
+        app_logger.addHandler(ui_handler)
+
+_init_logging()
 log = logging.getLogger("fiquebot")
+log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", LOG_CAPACITY)
 
-# ----------------------------- App init -----------------------------
-app = FastAPI(title="Fiquebot API", version="2.0.1")
+# ============================= App init =============================
+app = FastAPI(title="Fiquebot API", version="2.0.2")
 
-# ----------------------------- CORS -----------------------------
+# ============================= CORS =============================
 _default_origins = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
     "https://<YOUR-STATIC-WEB-APP>.azurestaticapps.net",
+    # add your actual SWA hostname if different
 ]
 _env_origins = os.environ.get("FRONTEND_ORIGINS") or os.environ.get("ALLOWED_ORIGINS")
 allow_origins = [o.strip() for o in _env_origins.split(",") if o.strip()] if _env_origins else _default_origins
@@ -43,7 +83,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------- Serve /ui -----------------------------
+# ============================= Serve /ui =============================
 if os.path.isdir("web"):
     app.mount("/ui", StaticFiles(directory="web", html=True), name="ui")
 
@@ -58,7 +98,7 @@ else:
             status_code=200,
         )
 
-# ----------------------------- Config -----------------------------
+# ============================= Config =============================
 TRN_EP = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com").rstrip("/")
 TRN_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
 TRN_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "westeurope")
@@ -76,7 +116,7 @@ LLM_SYS = "Return ONLY JSON Lines, one object per line. No commentary."
 ENTITY_CONF_THRESHOLD = float(os.environ.get("ENTITY_CONF_THRESHOLD", "0.60"))
 CSV_CHUNK = int(os.environ.get("CSV_CHUNK", "10000"))
 
-# ----------------------------- Small utils -----------------------------
+# ============================= Small utils =============================
 def _soft_require(cond: bool, msg: str) -> bool:
     if not cond:
         log.warning({"op": "soft-require-failed", "msg": msg})
@@ -86,7 +126,7 @@ def _soft_require(cond: bool, msg: str) -> bool:
 def is_truthy(s: Optional[str]) -> bool:
     return str(s or "").strip().lower() in {"1", "true", "yes", "y"}
 
-# ----------------------------- Dialing codes -----------------------------
+# ============================= Dialing codes =============================
 _NANP = {
     "united states", "united states of america", "usa", "canada",
     "bahamas", "barbados", "bermuda", "jamaica", "dominican republic", "haiti",
@@ -157,7 +197,7 @@ def country_to_dial(country: str, phone: str = "") -> str:
         return f"+{code}" if code else ""
     return ""
 
-# ----------------------------- Blob helpers -----------------------------
+# ============================= Blob helpers =============================
 def get_blob_client() -> Optional[BlobServiceClient]:
     if not _soft_require(STORAGE_ACCOUNT, "Storage account not configured"):
         return None
@@ -183,11 +223,11 @@ def ensure_container(blob_service: BlobServiceClient, name: str):
     except Exception as e:
         log.warning({"op": "container-create-skip", "name": name, "error": str(e)})
 
-# ----------------------------- HTTP helpers -----------------------------
+# ============================= HTTP helpers =============================
 def httpx_client(timeout: int = 90) -> httpx.Client:
     return httpx.Client(timeout=timeout)
 
-# ----------------------------- Translator (MS) -----------------------------
+# ============================= Translator (MS) =============================
 def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict]:
     if not (TRN_EP and TRN_KEY and TRN_REGION):
         return [{"translated": t or "", "lang": "en", "confidence": 1.0} for t in texts]
@@ -218,7 +258,7 @@ def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict
             out.extend([{"translated": t or "", "lang": "en", "confidence": 0.0} for t in batch])
     return out
 
-# ----------------------------- LLM batched (Azure OpenAI) -----------------------------
+# ============================= LLM batched (Azure OpenAI) =============================
 def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3300) -> List[Dict[str, Any]]:
     if not (AOAI_EP and AOAI_KEY and AOAI_DEP):
         raise RuntimeError("LLM not configured")
@@ -322,7 +362,7 @@ Rows:
         })
     return aligned
 
-# ----------------------------- Unified translation dispatcher -----------------------------
+# ============================= Unified translation dispatcher =============================
 def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Optional[str] = None) -> List[dict]:
     prov = (provider or TRANSLATE_PROVIDER or "llm").lower()
 
@@ -363,7 +403,7 @@ def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Option
         del batch, res; gc.collect()
     return out_full
 
-# ----------------------------- Text column choice -----------------------------
+# ============================= Text column choice =============================
 TEXT_COL_CANDIDATES = {"text", "message", "content", "description", "body"}
 
 def choose_text_col_from_header(headers: List[str], requested: Optional[str]) -> int:
@@ -377,7 +417,7 @@ def choose_text_col_from_header(headers: List[str], requested: Optional[str]) ->
             return i
     return 0 if headers else 0
 
-# ----------------------------- Streaming readers -----------------------------
+# ============================= Streaming readers =============================
 def iter_csv_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]]:
     first = True
     for chunk in pd.read_csv(
@@ -424,7 +464,7 @@ def iter_excel_rows(path: str, text_column: Optional[str]) -> Iterable[List[str]
     finally:
         wb.close()
 
-# ----------------------------- Core streaming processor -----------------------------
+# ============================= Core streaming processor =============================
 def process_rows_streaming(
     rows_iter: Iterable[List[str]],
     requested_text_col: Optional[str],
@@ -487,7 +527,7 @@ def process_rows_streaming(
 
     flush_batch()
 
-# ----------------------------- File helpers -----------------------------
+# ============================= File helpers =============================
 def stream_file_iter(path: str, chunk_size: int = 1024*256):
     with open(path, "rb") as f:
         while True:
@@ -520,10 +560,29 @@ def upload_processed_blob(blob_service: BlobServiceClient, processed_path: str, 
         client.upload_blob(fh, overwrite=True, content_settings=ContentSettings(content_type="text/csv"))
     log.info({"op":"blob-upload", "blob": f"processed/{processed_filename}", "bytes": os.path.getsize(processed_path)})
 
-# ----------------------------- Endpoints -----------------------------
+# ============================= Endpoints =============================
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    # Plain text makes it easy for quick checks; still JSON is fine if you prefer.
+    return PlainTextResponse("ok")
+
+@app.get("/logs")
+async def get_logs(limit: int = 500):
+    """
+    Return recent server logs for the UI. The buffer is process-local and capped.
+    Query: ?limit=500 (default)
+    """
+    try:
+        limit = max(1, min(limit, LOG_CAPACITY))
+    except Exception:
+        limit = 500
+    lines = list(_LOG_DEQUE)[-limit:]
+    # Disable caches
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    }
+    return JSONResponse({"logs": lines, "count": len(lines), "capacity": LOG_CAPACITY}, headers=headers)
 
 @app.get("/debug-env")
 async def debug_env():
@@ -540,6 +599,7 @@ async def debug_env():
         "STORAGE_ACCOUNT_NAME": os.environ.get("STORAGE_ACCOUNT_NAME"),
         "AZURE_STORAGE_CONNECTION_STRING": "REDACTED" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING") else "MISSING",
         "CORS_ALLOW_ORIGINS": allow_origins,
+        "LOG_BUFFER_CAPACITY": LOG_CAPACITY,
     }
 
 @app.post("/translate")
