@@ -7,9 +7,7 @@
   <!-- Tailwind (Play CDN) -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- ====== BACKEND ROUTING ======
-       When opened from your Static Web App domain, calls go to App Service.
-       When opened from FastAPI /ui locally, it uses same-origin. -->
+  <!-- ====== BACKEND ROUTING ====== -->
   <script>
     window.BACKEND_BASE =
       (location.hostname.endsWith('.azurestaticapps.net'))
@@ -57,18 +55,31 @@
       </div>
 
       <!-- Job progress -->
-      <div id="jobPanel" class="hidden rounded-xl border p-4">
+      <div id="jobPanel" class="hidden rounded-xl border p-4 space-y-3">
         <div class="flex items-center justify-between">
           <div>
             <div class="text-sm font-semibold">Job</div>
             <div id="jobId" class="text-xs text-gray-600"></div>
+            <div id="runId" class="text-[11px] text-gray-500"></div>
           </div>
           <div class="text-right">
             <div id="jobState" class="text-sm font-semibold">queued</div>
             <div id="jobEta" class="text-xs text-gray-500"></div>
           </div>
         </div>
-        <div id="jobDownloadWrap" class="hidden mt-3">
+
+        <!-- Progress bar -->
+        <div>
+          <div class="w-full bg-gray-200 rounded-full h-3">
+            <div id="progressBar" class="h-3 rounded-full bg-emerald-600 transition-all" style="width:0%"></div>
+          </div>
+          <div class="mt-1 text-xs text-gray-600">
+            <span id="progressLabel">0%</span>
+            <span id="progressCounts" class="ml-2">(0 / ? rows)</span>
+          </div>
+        </div>
+
+        <div id="jobDownloadWrap" class="hidden">
           <a id="jobDownloadA" class="text-emerald-700 underline">Download enriched CSV</a>
         </div>
       </div>
@@ -125,10 +136,17 @@
             <input id="autoScroll" type="checkbox" class="rounded" checked />
             <span>Auto-scroll</span>
           </label>
+          <label class="text-sm flex items-center gap-2">
+            <input id="filterCurrentRun" type="checkbox" class="rounded" checked />
+            <span>Only current job</span>
+          </label>
           <button id="clearLogs" class="px-3 py-1 rounded bg-gray-200">Clear</button>
         </div>
       </div>
-      <p class="text-xs text-gray-500">This panel shows <b>browser logs</b> and also streams <b>server logs</b> from <code>GET /logs</code> (last 500 lines, polled every ~5s).</p>
+      <p class="text-xs text-gray-500">
+        Shows browser logs and server logs from <code>GET /logs</code> (JSON; polled every ~5s).
+        When “Only current job” is on, we filter by <code>run_id</code>.
+      </p>
       <pre id="logs" class="bg-gray-100 rounded-xl p-3 text-xs h-56 overflow-auto"></pre>
     </section>
   </div>
@@ -173,32 +191,37 @@
       } catch (e) { logln('Ping failed:', e.toString()); alert('Ping failed: ' + e.toString()); }
     });
 
-    // ---------- Server log polling (/logs) ----------
-    let logSince = 0; // last timestamp we saw
+    // ---------- Server log polling (/logs JSON) ----------
+    let currentRunId = null;
     async function pollServerLogs() {
       const base = pickBackend();
       if (!base) return;
-      const url = base + '/logs' + (logSince ? ('?since=' + encodeURIComponent(String(logSince))) : '');
       try {
-        const r = await fetch(url, { headers: { 'Accept': 'text/plain' }});
+        const r = await fetch(base + '/logs'); // returns {items, count}
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        const last = r.headers.get('X-Last-Timestamp');
-        const txt = await r.text();
-        if (txt) {
-          // each line is already formatted
-          txt.split('\n').filter(Boolean).forEach(line => logln(line));
+        const j = await r.json();
+        const items = Array.isArray(j.items) ? j.items : [];
+        // Render nicely (filtered if requested)
+        const onlyCurrent = $('filterCurrentRun').checked && currentRunId;
+        const lines = [];
+        for (const it of items) {
+          const msg = it.message || it; // ring buffer stores obj in message
+          const ev = (msg && msg.event) ? msg.event : null;
+          const rid = (msg && msg.run_id) ? msg.run_id : null;
+          if (onlyCurrent && rid && rid !== currentRunId) continue;
+          const ts = it.ts || '';
+          lines.push(`${ts} ${ev ? '['+ev+'] ' : ''}${JSON.stringify(msg)}`);
         }
-        if (last) logSince = Number(last) || logSince;
+        // clear + re-render succinctly
+        const el = $('logs');
+        el.textContent = (lines.length ? lines.join('\n') + '\n' : el.textContent);
+        if ($('autoScroll').checked) el.scrollTop = el.scrollHeight;
       } catch (e) {
-        // don't spam alerts; just surface in panel
         logln('Server log poll error:', e.toString());
       }
     }
     setInterval(pollServerLogs, 5200);
-    // prime a first poll shortly after load
     setTimeout(pollServerLogs, 800);
-
-    // ---------- Clear logs button ----------
     $('clearLogs').addEventListener('click', () => { $('logs').textContent = ''; });
 
     // ---------- Upload & process (ASYNC) ----------
@@ -211,12 +234,21 @@
       const jobIdEl = $('jobId');
       const jobStateEl = $('jobState');
       const jobEtaEl = $('jobEta');
+      const runIdEl = $('runId');
       const jobDownloadWrap = $('jobDownloadWrap');
       const jobDownloadA = $('jobDownloadA');
+      const progressBar = $('progressBar');
+      const progressLabel = $('progressLabel');
+      const progressCounts = $('progressCounts');
 
       jobPanel.classList.add('hidden');
       jobDownloadWrap.classList.add('hidden');
       status.textContent = '';
+      progressBar.style.width = '0%';
+      progressLabel.textContent = '0%';
+      progressCounts.textContent = '(0 / ? rows)';
+      currentRunId = null;
+
       if (!file) { status.textContent = 'Pick a .xlsx/.xls/.xlsm/.csv file.'; return; }
 
       setBusy(btn, true);
@@ -238,22 +270,45 @@
         jobEtaEl.textContent = '';
         jobPanel.classList.remove('hidden');
 
-        // poll job state
         const jobUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id);
+        const progUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id) + '/progress';
         const dlUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id) + '/download';
+
+        // First fetch full job to discover run_id
+        try {
+          const r0 = await fetch(jobUrl);
+          const j0 = await r0.json();
+          if (j0 && j0.run_id) {
+            currentRunId = j0.run_id;
+            runIdEl.textContent = 'run_id: ' + currentRunId;
+          }
+        } catch {}
 
         async function poll() {
           try {
-            const r = await fetch(jobUrl);
+            const r = await fetch(progUrl);
             if (!r.ok) throw new Error('HTTP ' + r.status);
             const j = await r.json();
-            jobStateEl.textContent = j.state || 'unknown';
-            if (j.error) jobEtaEl.textContent = j.error;
-            else jobEtaEl.textContent = j.state === 'running' ? 'working…' :
-                                        j.state === 'queued' ? 'waiting to start…' : '';
+            const { state, rows_processed, total_rows, run_id } = j;
 
-            if (j.state === 'done') {
-              // try to grab filename from header
+            if (run_id && !currentRunId) {
+              currentRunId = run_id;
+              runIdEl.textContent = 'run_id: ' + currentRunId;
+            }
+
+            jobStateEl.textContent = state || 'unknown';
+            if (state === 'running') jobEtaEl.textContent = 'working…';
+            else if (state === 'queued') jobEtaEl.textContent = 'waiting to start…';
+            else jobEtaEl.textContent = '';
+
+            const haveTotal = (typeof total_rows === 'number' && total_rows > 0);
+            const pct = haveTotal ? Math.min(100, Math.round(100 * (rows_processed || 0) / total_rows)) : null;
+            progressBar.style.width = (pct === null ? '100%' : pct + '%');
+            progressBar.classList.toggle('animate-pulse', pct === null && state === 'running');
+            progressLabel.textContent = (pct === null ? '…' : `${pct}%`);
+            progressCounts.textContent = `(${rows_processed || 0} / ${haveTotal ? total_rows : '?' } rows)`;
+
+            if (state === 'done') {
               const resp = await fetch(dlUrl);
               if (!resp.ok) throw new Error('Download failed ' + resp.status);
               const disp = resp.headers.get('Content-Disposition');
@@ -269,27 +324,31 @@
               jobDownloadA.href = href; jobDownloadA.download = fname;
               jobDownloadWrap.classList.remove('hidden');
               status.textContent = 'Done. File downloaded.';
-              return; // stop polling
+              progressBar.style.width = '100%';
+              progressLabel.textContent = '100%';
+              return;
             }
 
-            if (j.state === 'error') {
+            if (state === 'error') {
+              const metaR = await fetch(jobUrl);
+              const meta = await metaR.json().catch(() => ({}));
               status.textContent = 'Job error. See logs.';
-              alert('Job failed: ' + (j.error || 'unknown'));
-              return; // stop polling
+              alert('Job failed: ' + (meta.error || 'unknown'));
+              return;
             }
           } catch (e) {
             logln('Job poll error:', e.toString());
           }
-          setTimeout(poll, 2500);
+          setTimeout(poll, 1200);
         }
-        setTimeout(poll, 1800);
+        setTimeout(poll, 900);
 
       } catch (e) {
         status.textContent = 'Error (see logs).';
         logln('Upload/Process error:', e.toString());
         alert('Error: ' + e.toString());
       } finally {
-        setBusy(btn, false);
+        setBusy($('btnUploadProcess'), false);
       }
     });
 
