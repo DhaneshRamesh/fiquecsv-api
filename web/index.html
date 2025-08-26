@@ -12,8 +12,7 @@
        When opened from FastAPI /ui locally, it uses same-origin. -->
   <script>
     window.BACKEND_BASE =
-      (location.hostname === 'orange-dune-0ea42a603.1.azurestaticapps.net' ||
-       location.hostname.endsWith('.azurestaticapps.net'))
+      (location.hostname.endsWith('.azurestaticapps.net'))
         ? 'https://fique-csv-cng0ewddbhhwebe8.westeurope-01.azurewebsites.net'
         : ''; // same-origin for local FastAPI /ui
     function pickBackend() { return window.BACKEND_BASE; }
@@ -21,31 +20,27 @@
 </head>
 <body class="bg-gray-50 text-gray-900">
   <div class="max-w-5xl mx-auto p-6 space-y-6">
-    <header class="flex items-center justify-between gap-3">
-      <div>
-        <h1 class="text-2xl font-bold">Fiquebot – Self-Service Translation & Entity Extraction</h1>
-        <p class="text-xs text-gray-500">Frontend: single-file, SWA + App Service ready</p>
-      </div>
-      <div class="text-right">
-        <div class="text-[11px] text-gray-500">Backend:</div>
-        <div class="flex items-center gap-2">
-          <code id="backendUrl" class="text-[11px] bg-gray-200 px-2 py-1 rounded select-all"></code>
-          <button id="copyBackend" class="text-[11px] px-2 py-1 rounded bg-gray-900 text-white">Copy</button>
-        </div>
-        <div id="healthBadge" class="mt-1 text-[11px]"></div>
+    <header class="flex items-center justify-between">
+      <h1 class="text-2xl font-bold">Fiquebot – Self-Service Translation & Entity Extraction</h1>
+      <div class="flex items-center gap-2 text-xs text-gray-600">
+        <span>Backend:</span>
+        <code id="backendBase" class="px-2 py-1 rounded bg-gray-200"></code>
+        <button id="copyBackend" class="px-2 py-1 rounded bg-gray-900 text-white">Copy</button>
+        <button id="pingBtn" class="px-2 py-1 rounded bg-emerald-600 text-white">/health OK</button>
       </div>
     </header>
 
     <!-- Tabs -->
     <nav class="flex gap-2">
-      <button data-tab="upload" class="tab-btn px-4 py-2 rounded-xl bg-gray-900 text-white">Upload & Process</button>
-      <button data-tab="existing" class="tab-btn px-4 py-2 rounded-xl bg-gray-200">Process Existing Blob</button>
+      <button data-tab="upload" class="tab-btn px-4 py-2 rounded-xl bg-gray-900 text-white">Upload & Process (Async)</button>
+      <button data-tab="existing" class="tab-btn px-4 py-2 rounded-xl bg-gray-200">Process Existing Blob (Sync)</button>
       <button data-tab="translate" class="tab-btn px-4 py-2 rounded-xl bg-gray-200">Translate Tester</button>
     </nav>
 
-    <!-- Upload & Process -->
+    <!-- Upload & Process (ASYNC) -->
     <section id="tab-upload" class="tab-panel bg-white rounded-2xl shadow p-5 space-y-4">
-      <h3 class="font-semibold">Upload file & process</h3>
+      <h3 class="font-semibold">Upload file & process (background job)</h3>
+      <p class="text-sm text-gray-600">Starts a background job and auto-downloads when it’s ready.</p>
       <div class="grid md:grid-cols-2 gap-4">
         <label class="block">
           <span class="text-sm">File (.xlsx / .xls / .xlsm / .csv)</span>
@@ -56,16 +51,30 @@
           <input id="textColumnUpload" class="mt-1 w-full rounded-xl border px-3 py-2" placeholder="e.g., message" />
         </label>
       </div>
-      <div class="flex items-center gap-3">
-        <button id="btnUploadProcess" class="px-4 py-2 rounded-xl bg-emerald-600 text-white">Upload & Process</button>
-        <span id="uploadStatus" class="text-sm text-gray-600"></span>
+      <div class="flex gap-3 items-center">
+        <button id="btnUploadProcess" class="px-4 py-2 rounded-xl bg-emerald-600 text-white">Start job</button>
+        <span id="uploadStatus" class="text-sm text-gray-700"></span>
       </div>
-      <div id="uploadDownloadLink" class="hidden">
-        <a id="downloadLinkUpload" class="text-emerald-700 underline">Download enriched CSV</a>
+
+      <!-- Job progress -->
+      <div id="jobPanel" class="hidden rounded-xl border p-4">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-sm font-semibold">Job</div>
+            <div id="jobId" class="text-xs text-gray-600"></div>
+          </div>
+          <div class="text-right">
+            <div id="jobState" class="text-sm font-semibold">queued</div>
+            <div id="jobEta" class="text-xs text-gray-500"></div>
+          </div>
+        </div>
+        <div id="jobDownloadWrap" class="hidden mt-3">
+          <a id="jobDownloadA" class="text-emerald-700 underline">Download enriched CSV</a>
+        </div>
       </div>
     </section>
 
-    <!-- Process Existing Blob -->
+    <!-- Process Existing Blob (SYNC) -->
     <section id="tab-existing" class="tab-panel hidden bg-white rounded-2xl shadow p-5 space-y-4">
       <h3 class="font-semibold">Process an existing blob in <code>incoming/</code></h3>
       <div class="grid md:grid-cols-2 gap-4">
@@ -78,9 +87,9 @@
           <input id="textColumnExisting" class="mt-1 w-full rounded-xl border px-3 py-2" placeholder="e.g., message" />
         </label>
       </div>
-      <div class="flex items-center gap-3">
-        <button id="btnProcessExisting" class="px-4 py-2 rounded-xl bg-indigo-600 text-white">Process</button>
-        <span id="existingStatus" class="text-sm text-gray-600"></span>
+      <div class="flex gap-3">
+        <button id="btnProcessExisting" class="px-4 py-2 rounded-xl bg-indigo-600 text-white">Process (sync)</button>
+        <span id="existingStatus" class="text-sm text-gray-700"></span>
       </div>
       <div id="existingDownloadLink" class="hidden">
         <a id="downloadLinkExisting" class="text-indigo-700 underline">Download enriched CSV</a>
@@ -100,9 +109,9 @@
           <input id="targetLang" value="en" class="mt-1 w-full rounded-xl border px-3 py-2" />
         </label>
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex gap-3">
         <button id="btnTranslate" class="px-4 py-2 rounded-xl bg-sky-600 text-white">Translate</button>
-        <span id="translateStatus" class="text-sm text-gray-600"></span>
+        <span id="translateStatus" class="text-sm text-gray-700"></span>
       </div>
       <pre id="translateOutput" class="bg-gray-100 rounded-xl p-3 text-sm overflow-auto"></pre>
     </section>
@@ -112,57 +121,32 @@
       <div class="flex items-center justify-between">
         <h2 class="font-semibold">Logs</h2>
         <div class="flex items-center gap-3">
-          <label class="text-xs text-gray-600 inline-flex items-center gap-1">
+          <label class="text-sm flex items-center gap-2">
             <input id="autoScroll" type="checkbox" class="rounded" checked />
-            Auto-scroll
+            <span>Auto-scroll</span>
           </label>
-          <button id="clearLogs" class="text-xs px-2 py-1 rounded bg-gray-200">Clear</button>
+          <button id="clearLogs" class="px-3 py-1 rounded bg-gray-200">Clear</button>
         </div>
       </div>
+      <p class="text-xs text-gray-500">This panel shows <b>browser logs</b> and also streams <b>server logs</b> from <code>GET /logs</code> (last 500 lines, polled every ~5s).</p>
       <pre id="logs" class="bg-gray-100 rounded-xl p-3 text-xs h-56 overflow-auto"></pre>
-      <div class="text-[11px] text-gray-500">
-        This panel shows <b>browser logs</b> and also streams <b>server logs</b> from <code>GET /logs</code> (last 500 lines, polled every 5s).
-      </div>
     </section>
   </div>
 
   <script>
-    // ----- Tiny helpers -----
+    // ---------- Tiny helpers ----------
     const $ = (id) => document.getElementById(id);
-    const backendBase = pickBackend();
-    $('backendUrl').textContent = backendBase || '(same-origin)';
-    $('copyBackend').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(backendBase || location.origin);
-      toast('Backend URL copied.');
-    });
-
-    function toast(msg) {
-      console.log('[toast]', msg);
-    }
-
-    // client log buffer (so we can re-render if needed)
-    const clientLogs = [];
+    function setBusy(el, busy) { if (!el) return; el.disabled = !!busy; el.classList.toggle('opacity-50', !!busy); }
+    function lineify(v) { return (typeof v === 'string' ? v : JSON.stringify(v)); }
     function logln(...args) {
-      const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-      clientLogs.push(line);
-      appendToLogPanel(line);
-      console.log(...args);
-    }
-    function appendToLogPanel(line) {
       const el = $('logs');
+      const line = args.map(lineify).join(' ');
       el.textContent += line + '\n';
       if ($('autoScroll').checked) el.scrollTop = el.scrollHeight;
+      console.log(...args);
     }
-
-    $('clearLogs').addEventListener('click', () => {
-      clientLogs.length = 0;
-      $('logs').textContent = '';
-    });
-
     function filenameFromContentDisposition(h) {
-      if (!h) return null;
-      const m = /filename="?([^"]+)"?/i.exec(h);
-      return m ? m[1] : null;
+      if (!h) return null; const m = /filename="?([^"]+)"?/i.exec(h); return m ? m[1] : null;
     }
     function setActiveTab(name) {
       document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
@@ -171,82 +155,145 @@
       document.querySelector(`.tab-btn[data-tab="${name}"]`).classList.add('bg-gray-900', 'text-white');
     }
     document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => setActiveTab(b.dataset.tab)));
-    setActiveTab('upload'); // default tab
+    setActiveTab('upload');
 
-    // ----- Health ping on load -----
-    (async function pingBackend() {
+    // ---------- Header wiring ----------
+    $('backendBase').textContent = pickBackend() || '(same-origin)';
+    $('copyBackend').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(pickBackend());
+      logln('Copied backend:', pickBackend());
+    });
+    $('pingBtn').addEventListener('click', async () => {
       try {
-        const url = backendBase + '/health';
+        const url = pickBackend() + '/health';
         logln('GET', url);
-        const r = await fetch(url, { cache: 'no-store' });
-        const txt = await r.text();
-        logln('Response', r.status, txt || '(empty)');
-        $('healthBadge').innerHTML =
-          r.ok
-            ? '<span class="inline-block px-2 py-0.5 rounded bg-emerald-100 text-emerald-700">/health OK</span>'
-            : '<span class="inline-block px-2 py-0.5 rounded bg-rose-100 text-rose-700">/health FAILED</span>';
-      } catch (e) {
-        $('healthBadge').innerHTML =
-          '<span class="inline-block px-2 py-0.5 rounded bg-rose-100 text-rose-700">/health ERROR</span>';
-        logln('Ping failed:', e.toString());
-      }
-    })();
+        const r = await fetch(url);
+        logln('Response', r.status, r.ok ? 'ok' : '');
+        alert(r.ok ? 'health OK' : `health failed ${r.status}`);
+      } catch (e) { logln('Ping failed:', e.toString()); alert('Ping failed: ' + e.toString()); }
+    });
 
-    // ----- Upload & process -----
+    // ---------- Server log polling (/logs) ----------
+    let logSince = 0; // last timestamp we saw
+    async function pollServerLogs() {
+      const base = pickBackend();
+      if (!base) return;
+      const url = base + '/logs' + (logSince ? ('?since=' + encodeURIComponent(String(logSince))) : '');
+      try {
+        const r = await fetch(url, { headers: { 'Accept': 'text/plain' }});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const last = r.headers.get('X-Last-Timestamp');
+        const txt = await r.text();
+        if (txt) {
+          // each line is already formatted
+          txt.split('\n').filter(Boolean).forEach(line => logln(line));
+        }
+        if (last) logSince = Number(last) || logSince;
+      } catch (e) {
+        // don't spam alerts; just surface in panel
+        logln('Server log poll error:', e.toString());
+      }
+    }
+    setInterval(pollServerLogs, 5200);
+    // prime a first poll shortly after load
+    setTimeout(pollServerLogs, 800);
+
+    // ---------- Clear logs button ----------
+    $('clearLogs').addEventListener('click', () => { $('logs').textContent = ''; });
+
+    // ---------- Upload & process (ASYNC) ----------
     $('btnUploadProcess').addEventListener('click', async () => {
       const btn = $('btnUploadProcess');
       const file = $('fileInput').files[0];
       const textCol = $('textColumnUpload').value.trim();
       const status = $('uploadStatus');
-      const dlWrap = $('uploadDownloadLink');
-      const dlA = $('downloadLinkUpload');
-      dlWrap.classList.add('hidden');
+      const jobPanel = $('jobPanel');
+      const jobIdEl = $('jobId');
+      const jobStateEl = $('jobState');
+      const jobEtaEl = $('jobEta');
+      const jobDownloadWrap = $('jobDownloadWrap');
+      const jobDownloadA = $('jobDownloadA');
+
+      jobPanel.classList.add('hidden');
+      jobDownloadWrap.classList.add('hidden');
       status.textContent = '';
-      if (!file) {
-        status.textContent = 'Pick a .xlsx/.xls/.xlsm/.csv file.';
-        return;
-      }
-      setDisabled(btn, true);
+      if (!file) { status.textContent = 'Pick a .xlsx/.xls/.xlsm/.csv file.'; return; }
+
+      setBusy(btn, true);
       try {
         const fd = new FormData();
         fd.append('file', file);
         if (textCol) fd.append('text_column', textCol);
-        const url = backendBase + '/process-upload';
-        logln('POST', url, '(multipart/form-data)', file.name);
-        const resp = await fetch(url, { method: 'POST', body: fd });
-        logln('Response', resp.status);
-        const bodyTxt = await resp.clone().text().catch(() => null);
-        if (!resp.ok) {
-          status.textContent = 'Processing failed';
-          logln('Error body:', bodyTxt || '(no body)');
-          alert('Processing failed: ' + (bodyTxt || resp.statusText));
-          return;
+
+        const startUrl = pickBackend() + '/process-upload-async';
+        logln('POST', startUrl, '(multipart/form-data)', file.name);
+        const startResp = await fetch(startUrl, { method: 'POST', body: fd });
+        const startText = await startResp.clone().text().catch(() => null);
+        if (!startResp.ok) throw new Error(startText || startResp.statusText);
+        const { job_id } = await startResp.json();
+        if (!job_id) throw new Error('No job_id returned');
+        status.textContent = 'Job started…';
+        jobIdEl.textContent = job_id;
+        jobStateEl.textContent = 'queued';
+        jobEtaEl.textContent = '';
+        jobPanel.classList.remove('hidden');
+
+        // poll job state
+        const jobUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id);
+        const dlUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id) + '/download';
+
+        async function poll() {
+          try {
+            const r = await fetch(jobUrl);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const j = await r.json();
+            jobStateEl.textContent = j.state || 'unknown';
+            if (j.error) jobEtaEl.textContent = j.error;
+            else jobEtaEl.textContent = j.state === 'running' ? 'working…' :
+                                        j.state === 'queued' ? 'waiting to start…' : '';
+
+            if (j.state === 'done') {
+              // try to grab filename from header
+              const resp = await fetch(dlUrl);
+              if (!resp.ok) throw new Error('Download failed ' + resp.status);
+              const disp = resp.headers.get('Content-Disposition');
+              const fname = filenameFromContentDisposition(disp) || 'enriched.csv';
+              const blob = await resp.blob();
+              const href = URL.createObjectURL(blob);
+
+              // auto-download
+              const a = document.createElement('a');
+              a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
+
+              // persistent link
+              jobDownloadA.href = href; jobDownloadA.download = fname;
+              jobDownloadWrap.classList.remove('hidden');
+              status.textContent = 'Done. File downloaded.';
+              return; // stop polling
+            }
+
+            if (j.state === 'error') {
+              status.textContent = 'Job error. See logs.';
+              alert('Job failed: ' + (j.error || 'unknown'));
+              return; // stop polling
+            }
+          } catch (e) {
+            logln('Job poll error:', e.toString());
+          }
+          setTimeout(poll, 2500);
         }
-        const disp = resp.headers.get('Content-Disposition');
-        const fname = filenameFromContentDisposition(disp) || (file.name.replace(/\.[^.]+$/, '') + '_enriched.csv');
-        const outBlob = await resp.blob();
-        const href = URL.createObjectURL(outBlob);
+        setTimeout(poll, 1800);
 
-        // auto-download
-        const a = document.createElement('a');
-        a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
-
-        // also show a persistent link
-        dlA.href = href;
-        dlA.download = fname;
-        dlWrap.classList.remove('hidden');
-        status.textContent = 'Done. File downloaded.';
-        logln('Ready to download:', fname);
       } catch (e) {
         status.textContent = 'Error (see logs).';
         logln('Upload/Process error:', e.toString());
         alert('Error: ' + e.toString());
       } finally {
-        setDisabled(btn, false);
+        setBusy(btn, false);
       }
     });
 
-    // ----- Process existing blob -----
+    // ---------- Process existing blob (SYNC) ----------
     $('btnProcessExisting').addEventListener('click', async () => {
       const btn = $('btnProcessExisting');
       const blobName = $('blobName').value.trim();
@@ -260,15 +307,14 @@
         status.textContent = "Provide a blob name like 'incoming/sample.xlsx'.";
         return;
       }
-      setDisabled(btn, true);
+      setBusy(btn, true);
       try {
         const q = new URLSearchParams();
         q.set('blob_name', blobName);
         if (textCol) q.set('text_column', textCol);
-        const url = backendBase + '/process-xlsx?' + q.toString();
+        const url = pickBackend() + '/process-xlsx?' + q.toString();
         logln('POST', url);
         const resp = await fetch(url, { method: 'POST' });
-        logln('Response', resp.status);
         const bodyTxt = await resp.clone().text().catch(() => null);
         if (!resp.ok) {
           status.textContent = 'Processing failed';
@@ -277,8 +323,7 @@
           return;
         }
         const disp = resp.headers.get('Content-Disposition');
-        const baseIn = blobName.split('/').pop() || 'file';
-        const fname = filenameFromContentDisposition(disp) || (baseIn.replace(/\.[^.]+$/, '') + '_enriched.csv');
+        const fname = filenameFromContentDisposition(disp) || (blobName.split('/').pop().replace(/\.[^.]+$/, '') + '_enriched.csv');
         const outBlob = await resp.blob();
         const href = URL.createObjectURL(outBlob);
 
@@ -286,10 +331,8 @@
         const a = document.createElement('a');
         a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
 
-        // also show a persistent link
-        dlA.href = href;
-        dlA.download = fname;
-        dlWrap.classList.remove('hidden');
+        // persistent link
+        dlA.href = href; dlA.download = fname; dlWrap.classList.remove('hidden');
         status.textContent = 'Done. File downloaded.';
         logln('Ready to download:', fname);
       } catch (e) {
@@ -297,78 +340,45 @@
         logln('Process existing error:', e.toString());
         alert('Error: ' + e.toString());
       } finally {
-        setDisabled(btn, false);
+        setBusy(btn, false);
       }
     });
 
-    // ----- Translate tester -----
+    // ---------- Translate tester ----------
     $('btnTranslate').addEventListener('click', async () => {
       const btn = $('btnTranslate');
       const out = $('translateOutput');
       const status = $('translateStatus');
-      out.textContent = '';
-      status.textContent = '';
+      out.textContent = ''; status.textContent = '';
       const lines = $('textsInput').value.split('\n').map(s => s.trim()).filter(Boolean);
       const to = $('targetLang').value.trim() || 'en';
-      if (lines.length === 0) {
-        status.textContent = 'Enter one or more lines.';
-        return;
-      }
-      setDisabled(btn, true);
+      if (lines.length === 0) { status.textContent = 'Enter one or more lines.'; return; }
+      setBusy(btn, true);
       try {
-        const url = backendBase + '/translate';
-        const resp = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ texts: lines, to })
-        });
-        logln('POST', url, resp.status);
-        const j = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(JSON.stringify(j));
+        const url = pickBackend() + '/translate';
+        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ texts: lines, to }) });
+        const j = await resp.json().catch(() => null);
+        if (!resp.ok) throw new Error(JSON.stringify(j || { error: resp.statusText }));
         out.textContent = JSON.stringify(j, null, 2);
         status.textContent = 'OK';
+        logln('POST', url, '200 OK');
       } catch (e) {
         status.textContent = 'Error (see logs).';
         logln('Translate error:', e.toString());
-      } finally {
-        setDisabled(btn, false);
-      }
+      } finally { setBusy(btn, false); }
     });
 
-    function setDisabled(el, v) {
-      if (!el) return;
-      el.disabled = !!v;
-      el.classList.toggle('opacity-50', !!v);
-      el.classList.toggle('pointer-events-none', !!v);
-    }
-
-    // ===== Server logs polling (/logs) =====
-    // We keep an index of how many lines we've displayed to avoid re-appending duplicates.
-    let serverLogCursor = 0;
-    async function pollServerLogs() {
-      const url = backendBase + '/logs';
+    // ----- Initial ping on load -----
+    (async function pingBackend() {
       try {
-        const resp = await fetch(url, { cache: 'no-store' });
-        if (!resp.ok) {
-          logln('GET', url, '->', resp.status);
-          return;
-        }
-        const data = await resp.json();
-        const lines = Array.isArray(data.logs) ? data.logs : [];
-        // append only new lines since last poll
-        if (lines.length > serverLogCursor) {
-          for (let i = serverLogCursor; i < lines.length; i++) {
-            appendToLogPanel(lines[i]);
-          }
-          serverLogCursor = lines.length;
-        }
-      } catch (e) {
-        logln('Log fetch error:', e.toString());
-      }
-    }
-    setInterval(pollServerLogs, 5000);
-    // initial kick
-    pollServerLogs();
+        const url = pickBackend() + '/health';
+        logln('GET', url);
+        const r = await fetch(url);
+        logln('Response', r.status, r.ok ? 'ok' : '');
+        const j = await r.json().catch(() => null);
+        logln('Body:', j || '(no json body)');
+      } catch (e) { logln('Ping failed:', e.toString()); }
+    })();
   </script>
 </body>
 </html>
