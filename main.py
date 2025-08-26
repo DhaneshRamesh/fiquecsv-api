@@ -81,7 +81,7 @@ if ring_handler not in log.handlers:
 log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", ring_handler.capacity)
 
 # ============================= App init & CORS =============================
-app = FastAPI(title="Fiquebot API", version="2.2.0")
+app = FastAPI(title="Fiquebot API", version="2.2.1")
 
 _default_origins = [
     "http://localhost:8000",
@@ -199,7 +199,7 @@ def _infer_from_phone(phone: str) -> str:
     if not phone:
         return ""
     digits = re.sub(r"[^\d]", "", phone)
-    if phone.strip().startswith("00"):
+    if phone.strip().startsWith("00"):
         digits = digits[2:]
     for pref in _DIAL_PREFIXES:
         if digits.startswith(pref):
@@ -495,14 +495,13 @@ def estimate_total_rows(in_path: str, original_name: str) -> Optional[int]:
             with open(in_path, "rb") as fh:
                 data = fh.read()
             total = data.count(b"\n")
-            # Assume header present for CSV produced by real users; protect against 0
             return max(0, total - 1)
         if name.endswith((".xlsx", ".xlsm", ".xls")):
             wb = load_workbook(in_path, read_only=True, data_only=True)
             try:
                 ws = wb.active
                 mr = int(ws.max_row or 0)
-                return max(0, mr - 1)  # minus header row
+                return max(0, mr - 1)  # minus header
             finally:
                 wb.close()
     except Exception as e:
@@ -516,7 +515,7 @@ def process_rows_streaming(
     to_lang: str,
     provider: Optional[str],
     outfile: io.TextIOBase,
-    on_progress: Optional[Callable[[int, int], None]] = None,  # args: rows_added, batches_added
+    on_progress: Optional[Callable[[int, int], None]] = None,  # rows_added, batches_added
 ):
     writer = csv.writer(outfile, lineterminator="\n")
     header = next(rows_iter, None)
@@ -560,7 +559,7 @@ def process_rows_streaming(
             ])
             written += 1
         if on_progress:
-            on_progress(written, 1)  # rows_added, batches_added
+            on_progress(written, 1)
         buf_rows.clear(); buf_texts.clear()
         gc.collect()
 
@@ -643,7 +642,6 @@ class Job:
     incoming_blob: Optional[str] = None
     processed_filename: Optional[str] = None
     processed_path: Optional[str] = None
-    # NEW: progress fields (ROW-based, not batch-based)
     rows_processed: int = 0
     batches_processed: int = 0
     total_rows: Optional[int] = None
@@ -664,7 +662,6 @@ async def _run_upload_job(job: Job, data: bytes):
         os.close(in_fd)
         await anyio.to_thread.run_sync(lambda: open(in_path, "wb").write(data))
 
-        # Estimate total rows up-front (used for progress bars)
         job.total_rows = estimate_total_rows(in_path, safe_base)
         json_log("processing_started", run_id=req_id, file=safe_base, total_rows=job.total_rows)
 
@@ -686,7 +683,6 @@ async def _run_upload_job(job: Job, data: bytes):
         def _on_progress(rows_added: int, batches_added: int):
             job.rows_processed += int(rows_added)
             job.batches_processed += int(batches_added)
-            # Emit STRUCTURED, ROW-based progress every flush:
             json_log(
                 "progress",
                 run_id=req_id,
@@ -861,7 +857,6 @@ async def process_upload(
         await anyio.to_thread.run_sync(lambda: open(in_path, "wb").write(data))
         del data; gc.collect()
 
-        # progress estimation + logs (sync variant)
         total_rows = estimate_total_rows(in_path, safe_base)
         json_log("processing_started", run_id=req_id, file=safe_base, total_rows=total_rows)
         rows_processed = 0
@@ -953,7 +948,6 @@ async def job_progress(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
-    # Minimal payload for fast polling
     return {
         "job_id": job.id,
         "state": job.state,
@@ -970,5 +964,6 @@ async def job_download(job_id: str):
         raise HTTPException(404, "job not found")
     if job.state != JobState.done or not job.processed_path:
         raise HTTPException(409, "not ready")
-    headers = {"Content-Disposition": f'attachment; filename="{job.processed_filename or 'output.csv'}'"}
+    fname = job.processed_filename or "output.csv"     # ✅ fixed: avoid nested quotes in f-string
+    headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return StreamingResponse(stream_file_iter(job.processed_path), media_type="text/csv", headers=headers)
