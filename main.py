@@ -81,7 +81,7 @@ if ring_handler not in log.handlers:
 log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", ring_handler.capacity)
 
 # ============================= App init & CORS =============================
-app = FastAPI(title="Fiquebot API", version="2.2.1")
+app = FastAPI(title="Fiquebot API", version="2.2.2")
 
 _default_origins = [
     "http://localhost:8000",
@@ -199,7 +199,8 @@ def _infer_from_phone(phone: str) -> str:
     if not phone:
         return ""
     digits = re.sub(r"[^\d]", "", phone)
-    if phone.strip().startsWith("00"):
+    # ✅ Python method name
+    if phone.strip().startswith("00"):
         digits = digits[2:]
     for pref in _DIAL_PREFIXES:
         if digits.startswith(pref):
@@ -495,13 +496,14 @@ def estimate_total_rows(in_path: str, original_name: str) -> Optional[int]:
             with open(in_path, "rb") as fh:
                 data = fh.read()
             total = data.count(b"\n")
+            # Assume header present; protect against zero
             return max(0, total - 1)
         if name.endswith((".xlsx", ".xlsm", ".xls")):
             wb = load_workbook(in_path, read_only=True, data_only=True)
             try:
                 ws = wb.active
                 mr = int(ws.max_row or 0)
-                return max(0, mr - 1)  # minus header
+                return max(0, mr - 1)  # minus header row
             finally:
                 wb.close()
     except Exception as e:
@@ -964,6 +966,6 @@ async def job_download(job_id: str):
         raise HTTPException(404, "job not found")
     if job.state != JobState.done or not job.processed_path:
         raise HTTPException(409, "not ready")
-    fname = job.processed_filename or "output.csv"     # ✅ fixed: avoid nested quotes in f-string
+    fname = job.processed_filename or "output.csv"     # fixed: avoid nested quotes in f-string
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return StreamingResponse(stream_file_iter(job.processed_path), media_type="text/csv", headers=headers)
