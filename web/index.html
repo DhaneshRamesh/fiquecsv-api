@@ -7,13 +7,30 @@
   <!-- Tailwind (Play CDN) -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- ====== BACKEND ROUTING ====== -->
+  <!-- ====== BACKEND ROUTING (SWA + local dev friendly) ====== -->
   <script>
-    window.BACKEND_BASE =
-      (location.hostname.endsWith('.azurestaticapps.net'))
-        ? 'https://fique-csv-cng0ewddbhhwebe8.westeurope-01.azurewebsites.net'
-        : ''; // same-origin for local FastAPI /ui
-    function pickBackend() { return window.BACKEND_BASE; }
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const override = params.get('api') || localStorage.getItem('BACKEND_BASE') || '';
+      const onSWA = /\.azurestaticapps\.net$/i.test(location.hostname);
+
+      // Canonical App Service URL (stable across stamps)
+      const APP_SERVICE_URL = 'https://fique-csv.azurewebsites.net';
+
+      // Priority:
+      // 1) ?api=... (one-off)  2) localStorage BACKEND_BASE (sticky)  3) SWA -> App Service  4) local dev
+      const resolved = override
+        ? override
+        : (onSWA ? APP_SERVICE_URL : 'http://localhost:8000');
+
+      // Persist if provided via query for future loads
+      if (params.get('api')) {
+        try { localStorage.setItem('BACKEND_BASE', resolved); } catch {}
+      }
+
+      window.BACKEND_BASE = resolved;
+      window.pickBackend = function pickBackend() { return window.BACKEND_BASE; };
+    })();
   </script>
 </head>
 <body class="bg-gray-50 text-gray-900">
@@ -176,7 +193,7 @@
     setActiveTab('upload');
 
     // ---------- Header wiring ----------
-    $('backendBase').textContent = pickBackend() || '(same-origin)';
+    $('backendBase').textContent = pickBackend() || '(unset)';
     $('copyBackend').addEventListener('click', async () => {
       await navigator.clipboard.writeText(pickBackend());
       logln('Copied backend:', pickBackend());
@@ -197,7 +214,7 @@
       const base = pickBackend();
       if (!base) return;
       try {
-        const r = await fetch(base + '/logs'); // returns {items, count}
+        const r = await fetch(base + '/logs');
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const j = await r.json();
         const items = Array.isArray(j.items) ? j.items : [];
@@ -213,7 +230,6 @@
           const payload = (typeof msg === 'string') ? msg : JSON.stringify(msg);
           lines.push(`${ts} ${ev ? '['+ev+'] ' : ''}${payload}`);
         }
-        // Always rewrite the panel (prevents duplicates and respects filter toggle)
         const el = $('logs');
         el.textContent = lines.join('\n') + (lines.length ? '\n' : '');
         if ($('autoScroll').checked) el.scrollTop = el.scrollHeight;
@@ -275,7 +291,6 @@
         const progUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id) + '/progress';
         const dlUrl = pickBackend() + '/jobs/' + encodeURIComponent(job_id) + '/download';
 
-        // First fetch full job to discover run_id
         try {
           const r0 = await fetch(jobUrl);
           if (r0.ok) {
@@ -319,11 +334,9 @@
               const blob = await resp.blob();
               const href = URL.createObjectURL(blob);
 
-              // auto-download
               const a = document.createElement('a');
               a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
 
-              // persistent link
               jobDownloadA.href = href; jobDownloadA.download = fname;
               jobDownloadWrap.classList.remove('hidden');
               status.textContent = 'Done. File downloaded.';
@@ -389,11 +402,9 @@
         const outBlob = await resp.blob();
         const href = URL.createObjectURL(outBlob);
 
-        // auto-download
         const a = document.createElement('a');
         a.href = href; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
 
-        // persistent link
         dlA.href = href; dlA.download = fname; dlWrap.classList.remove('hidden');
         status.textContent = 'Done. File downloaded.';
         logln('Ready to download:', fname);
