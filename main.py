@@ -5,7 +5,7 @@ from enum import Enum
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -81,7 +81,7 @@ if ring_handler not in log.handlers:
 log.info("fiquebot backend starting with in-memory log buffer (capacity=%d)", ring_handler.capacity)
 
 # ============================= App init & CORS =============================
-app = FastAPI(title="Fiquebot API", version="2.2.2")
+app = FastAPI(title="Fiquebot API", version="2.3.0")
 
 _default_origins = [
     "http://localhost:8000",
@@ -122,18 +122,20 @@ TRN_EP = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.micr
 TRN_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
 TRN_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "westeurope")
 
+# === UPDATED DEFAULTS FOR 4.1 MINI + STRUCTURED OUTPUTS ===
 AOAI_EP = (os.environ.get("AZURE_OPENAI_ENDPOINT", "") or "").rstrip("/")
-AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
-AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
+AOAI_DEP = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+AOAI_VER = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 AOAI_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 
 STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "fiqueuploadstore")
 
 TRANSLATE_PROVIDER = os.environ.get("TRANSLATE_PROVIDER", "llm").lower()  # "llm" | "ms"
 LLM_MAX_BATCH = int(os.environ.get("LLM_MAX_BATCH", "80"))  # balance speed/peak memory
-LLM_SYS = "Return ONLY JSON Lines, one object per line. No commentary."
+LLM_SYS = "You output ONLY valid JSON that matches the provided schema. No commentary."
 ENTITY_CONF_THRESHOLD = float(os.environ.get("ENTITY_CONF_THRESHOLD", "0.60"))
 CSV_CHUNK = int(os.environ.get("CSV_CHUNK", "10000"))
+LLM_SEED = int(os.environ.get("LLM_SEED", "7"))
 
 # ============================= Small utils =============================
 def _soft_require(cond: bool, msg: str) -> bool:
@@ -199,7 +201,6 @@ def _infer_from_phone(phone: str) -> str:
     if not phone:
         return ""
     digits = re.sub(r"[^\d]", "", phone)
-    # ✅ Python method name
     if phone.strip().startswith("00"):
         digits = digits[2:]
     for pref in _DIAL_PREFIXES:
@@ -282,10 +283,43 @@ def _translate_and_detect_ms(texts: List[str], to_lang: str = "en") -> List[dict
             out.extend([{"translated": t or "", "lang": "en", "confidence": 0.0} for t in batch])
     return out
 
-# ============================= LLM batched (Azure OpenAI) =============================
+# ============================= LLM batched (Azure OpenAI, 4.1 structured) =============================
+def _rows_schema(strict: bool = True) -> Dict[str, Any]:
+    """JSON Schema used for structured outputs"""
+    return {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id","translated","lang","confidence","country","phone","book","language_mentioned","address"],
+                    "properties": {
+                        "id": {"type":"integer"},
+                        "translated": {"type":"string"},
+                        "lang": {"type":"string"},
+                        "confidence": {"type":"number"},
+                        "country": {"type":"string"},
+                        "phone": {"type":"string"},
+                        "book": {"type":"string", "enum":["Gyan Ganga","Way of Living",""]},
+                        "language_mentioned": {"type":"string"},
+                        "address": {"type":"string"}
+                    },
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["rows"],
+        "additionalProperties": False
+    }
+
 def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3300) -> List[Dict[str, Any]]:
+    """
+    With GPT-4.1+ structured outputs, this returns a list of row dicts from a single JSON object: {"rows":[...]}.
+    """
     if not (AOAI_EP and AOAI_KEY and AOAI_DEP):
         raise RuntimeError("LLM not configured")
+
     url = f"{AOAI_EP}/openai/deployments/{AOAI_DEP}/chat/completions?api-version={AOAI_VER}"
     headers = {"Content-Type": "application/json", "api-key": AOAI_KEY}
     body = {
@@ -293,30 +327,37 @@ def _llm_chat_jsonl(prompt: str, temperature: float = 0, max_tokens: int = 3300)
             {"role": "system", "content": LLM_SYS},
             {"role": "user", "content": prompt},
         ],
-        "temperature": temperature,
+        "temperature": 0,        # deterministic
+        "top_p": 0,              # deterministic
+        "seed": LLM_SEED,        # reproducible
         "max_tokens": max_tokens,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "rows_schema",
+                "schema": _rows_schema(strict=True),
+                "strict": True
+            }
+        }
     }
-    for attempt in range(5):
+
+    for attempt in range(3):
         try:
             with httpx_client(120) as h:
                 r = h.post(url, headers=headers, json=body)
                 r.raise_for_status()
                 j = r.json()
             content = (j["choices"][0]["message"]["content"] or "").strip()
-            out = []
-            for line in content.splitlines():
-                s = line.strip()
-                if not s:
-                    continue
-                try:
-                    out.append(json.loads(s))
-                except Exception:
-                    continue
-            return out
+            obj = json.loads(content)
+            rows = obj.get("rows", [])
+            if not isinstance(rows, list):
+                raise ValueError("structured output missing 'rows' array")
+            return rows
         except Exception as e:
-            wait = min(2 ** attempt, 20)
-            log.warning({"event":"llm-retry", "attempt": attempt + 1, "wait": wait, "error": str(e)})
+            wait = min(2 ** attempt, 8)
+            log.warning({"event":"llm-retry","attempt":attempt+1,"wait":wait,"error":str(e)})
             time.sleep(wait)
+
     raise RuntimeError("LLM call failed after retries")
 
 def _batch_rows_to_lines(rows: List[Dict[str, Any]]) -> str:
@@ -326,25 +367,35 @@ def _batch_rows_to_lines(rows: List[Dict[str, Any]]) -> str:
     return "\n".join([f'- id="{r["id"]}" text="{esc(r["text"])}"' for r in rows])
 
 def llm_translate_and_extract_batch(texts: List[str], to_lang: str = "en") -> List[dict]:
+    """
+    Single-pass: detect language, translate to en, extract entities. Uses structured outputs ("rows":[...]).
+    """
     rows = [{"id": i, "text": (t or "")} for i, t in enumerate(texts)]
     lines = _batch_rows_to_lines(rows)
     prompt = f"""
 You are a professional translator and information extractor.
 
 For each input row:
-1) Detect language of "text".
+1) Detect the language of "text".
 2) Translate "text" to {to_lang}.
 3) Extract entities from the translated English text:
-   - country, phone, book ("Gyan Ganga"|"Way of Living"|""), language_mentioned, address
+   - country, phone, book ("Gyan Ganga"|"Way of Living"|""), language_mentioned, address.
 
-Output exactly one JSON object per input row (JSONL).
-Keys: id, translated, lang, confidence, country, phone, book, language_mentioned, address.
+Output a single JSON object with a top-level key "rows", where each item is:
+{{"id": number, "translated": string, "lang": string, "confidence": number, "country": string, "phone": string, "book": string, "language_mentioned": string, "address": string}}
+
+Rules:
+- If unknown, use "" (empty string). Do NOT invent values.
+- Never include any keys beyond the schema.
+- The "lang" is the detected source language (ISO-ish code, lowercase).
+- "confidence" ∈ [0,1].
 
 Rows:
 {lines}
-"""
-    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=3300)
-    out_map = {int(o.get("id", -1)): o for o in output if "id" in o}
+""".strip()
+
+    output_rows = _llm_chat_jsonl(prompt, temperature=0, max_tokens=3300)
+    out_map = {int(o.get("id", -1)): o for o in output_rows if "id" in o}
     aligned: List[dict] = []
     for i, t in enumerate(texts):
         o = out_map.get(i) or {}
@@ -361,23 +412,34 @@ Rows:
     return aligned
 
 def llm_entities_only_batch(texts_en: List[str]) -> List[dict]:
+    """
+    Entities-only: text is already English. Uses structured outputs with the same schema (translated/lang/confidence still present).
+    """
     rows = [{"id": i, "text": (t or "")} for i, t in enumerate(texts_en)]
     lines = _batch_rows_to_lines(rows)
     prompt = f"""
-You are an information extractor. Each row "text" is English.
+You are an information extractor. Each row "text" is already English.
 
 Extract: country, phone, book("Gyan Ganga"|"Way of Living"|""), language_mentioned, address.
-Return one JSON object per line with keys: id,country,phone,book,language_mentioned,address.
+Return a JSON object with "rows":[{{id,country,phone,book,language_mentioned,address,translated,lang,confidence}}].
+- Set "translated" to the input text unchanged.
+- Set "lang" to "en" and "confidence" to 1 if confident; else lower confidence in [0,1].
+
+Rules: If unknown, use "" (empty). Never add extra keys.
 
 Rows:
 {lines}
-"""
-    output = _llm_chat_jsonl(prompt, temperature=0, max_tokens=2800)
-    out_map = {int(o.get("id", -1)): o for o in output if "id" in o}
+""".strip()
+
+    output_rows = _llm_chat_jsonl(prompt, temperature=0, max_tokens=2800)
+    out_map = {int(o.get("id", -1)): o for o in output_rows if "id" in o}
     aligned: List[dict] = []
     for i in range(len(texts_en)):
         o = out_map.get(i) or {}
         aligned.append({
+            "translated": str(o.get("translated", texts_en[i] or "")),
+            "lang": str(o.get("lang", "en")),
+            "confidence": float(o.get("confidence", 1.0) or 1.0),
             "country": str(o.get("country", "")),
             "phone": str(o.get("phone", "")),
             "book": str(o.get("book", "")),
@@ -400,14 +462,19 @@ def translate_and_detect(texts: List[str], to_lang: str = "en", provider: Option
                 ents = llm_entities_only_batch(part)
             except Exception as e:
                 log.warning({"event":"llm-entities-failed", "slice": [i, i+len(part)], "error": str(e)})
-                ents = [{"country":"", "phone":"", "book":"", "language_mentioned":"", "address":""} for _ in part]
+                ents = [{
+                    "translated": p,
+                    "lang": "en",
+                    "confidence": 0.0,
+                    "country":"", "phone":"", "book":"", "language_mentioned":"", "address":""
+                } for p in part]
             ents_full.extend(ents)
             del part; gc.collect()
 
         out: List[dict] = []
         for r, e in zip(trans, ents_full):
             out.append({
-                "translated": r.get("translated", ""),
+                "translated": e.get("translated", r.get("translated","")),
                 "lang": r.get("lang", ""),
                 "confidence": float(r.get("confidence", 0.0) or 0.0),
                 "country": e.get("country",""),
@@ -496,14 +563,13 @@ def estimate_total_rows(in_path: str, original_name: str) -> Optional[int]:
             with open(in_path, "rb") as fh:
                 data = fh.read()
             total = data.count(b"\n")
-            # Assume header present; protect against zero
             return max(0, total - 1)
         if name.endswith((".xlsx", ".xlsm", ".xls")):
             wb = load_workbook(in_path, read_only=True, data_only=True)
             try:
                 ws = wb.active
                 mr = int(ws.max_row or 0)
-                return max(0, mr - 1)  # minus header row
+                return max(0, mr - 1)
             finally:
                 wb.close()
     except Exception as e:
@@ -746,6 +812,7 @@ async def debug_env():
         "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT"),
         "AZURE_OPENAI_API_KEY": "REDACTED" if os.environ.get("AZURE_OPENAI_API_KEY") else "MISSING",
         "AZURE_OPENAI_DEPLOYMENT": AOAI_DEP,
+        "AZURE_OPENAI_API_VERSION": AOAI_VER,
         "TRANSLATE_PROVIDER": TRANSLATE_PROVIDER,
         "LLM_MAX_BATCH": LLM_MAX_BATCH,
         "CSV_CHUNK": CSV_CHUNK,
@@ -966,6 +1033,6 @@ async def job_download(job_id: str):
         raise HTTPException(404, "job not found")
     if job.state != JobState.done or not job.processed_path:
         raise HTTPException(409, "not ready")
-    fname = job.processed_filename or "output.csv"     # fixed: avoid nested quotes in f-string
+    fname = job.processed_filename or "output.csv"
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return StreamingResponse(stream_file_iter(job.processed_path), media_type="text/csv", headers=headers)
