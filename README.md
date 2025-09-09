@@ -7,10 +7,26 @@ This project is a production-ready pattern that turns a customer-uploaded Excel 
 * 📖 Book 
 * 🏷️ Language mentioned in the text
 
-**Problem:** Manual Excel/CSV data updates for chatbot knowledge base were slow and error-prone.  
-**Tech:** Python (FastAPI), Azure Blob Storage, Event Grid, Azure Translator, Azure OpenAI (GPT-4o).  
-**Result:** Automated ingestion + translation + entity extraction pipeline, reducing update effort by 70%.  
-**Impact:** Ensured chatbot served 500+ daily queries with up-to-date, enriched knowledge.  
+## 📌 PTRI (Problem → Tech → Result → Impact)
+
+**Problem:**  
+Manual Excel/CSV enrichment (translation + entity extraction) was slow, error-prone, and hard to scale across multiple users.  
+
+**Tech:**  
+- Python (FastAPI)  
+- Azure Blob Storage + Event Grid  
+- Azure Translator (text translation)  
+- Azure OpenAI GPT-4o (JSON-based entity extraction)  
+- GitHub Actions (CI/CD)  
+
+**Result:**  
+- Automated ingestion + enrichment pipeline reducing processing time by **70%**  
+- Structured outputs with enriched columns: Country, Phone, Language, Book  
+
+**Impact:**  
+- Enabled real-time, scalable enrichment of business datasets over 100k rows  
+- Improved data consistency and usability for downstream analytics  
+- Reduced manual workload and errors in enterprise reporting workflows   
 
 ## 📐 High-Level Architecture
 
