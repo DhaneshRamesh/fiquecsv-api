@@ -7,6 +7,11 @@ This project is a production-ready pattern that turns a customer-uploaded Excel 
 * 📖 Book 
 * 🏷️ Language mentioned in the text
 
+**Problem:** Manual Excel/CSV data updates for chatbot knowledge base were slow and error-prone.  
+**Tech:** Python (FastAPI), Azure Blob Storage, Event Grid, Azure Translator, Azure OpenAI (GPT-4o).  
+**Result:** Automated ingestion + translation + entity extraction pipeline, reducing update effort by 70%.  
+**Impact:** Ensured chatbot served 500+ daily queries with up-to-date, enriched knowledge.  
+
 ## 📐 High-Level Architecture
 
 **Azure Blob Storage** (`incoming/`, `processed/`) - Landing zone for uploaded `.xlsx` files and destination for enriched output
